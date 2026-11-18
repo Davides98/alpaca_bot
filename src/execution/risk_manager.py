@@ -1,0 +1,325 @@
+"""
+Modulo 5b - Risk Management.
+
+- Position sizing: qty = floor(rischio_massimo / max_loss_per_contratto).
+- Gestione posizioni aperte (prima di cercare nuovi trade):
+    1. Take Profit  (+50% del credito massimo / +40% del debito pagato)
+    2. Stop Loss    (-100% del credito incassato / -30% del debito pagato)
+    3. Protezione assegnazione: DTE <= CLOSE_DTE_THRESHOLD
+
+Le posizioni Alpaca sono per singolo contratto: le raggruppiamo per (sottostante, scadenza) e le
+abbiniamo al trade OPEN salvato su Supabase (se disponibile) per recuperare strategia e prezzo di entrata.
+
+Convenzione: `entry_net` = prezzo netto dell'ordine di apertura (+ debito / - credito).
+`position_value` = valore attuale della posizione (long - short, a mid).
+P&L per unità = position_value - entry_net.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from functools import reduce
+from typing import TYPE_CHECKING, Any
+
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import AssetClass, OrderSide, PositionIntent, PositionSide, QueryOrderStatus
+from alpaca.trading.models import Position
+from alpaca.trading.requests import GetOrdersRequest
+from loguru import logger
+
+from config.settings import Settings
+
+if TYPE_CHECKING:  # evita import circolari a runtime
+    from src.data.market_data import MarketDataService
+    from src.execution.executor import ExecutionResult, OrderExecutor, OrderLegSpec
+    from src.storage.supabase_client import SupabaseStorage
+
+CONTRACT_MULTIPLIER = 100
+
+
+# ---------------------------------------------------------------------- #
+# Funzioni pure
+# ---------------------------------------------------------------------- #
+def position_size(max_loss_per_contract: float, equity: float, risk_pct: float, max_contracts: int) -> int:
+    """Numero di contratti tale che la perdita massima non superi risk_pct dell'equity."""
+    if max_loss_per_contract <= 0 or equity <= 0:
+        return 0
+    return max(0, min(max_contracts, math.floor(equity * risk_pct / max_loss_per_contract)))
+
+
+def evaluate_exit(entry_net: float, position_value: float, dte: int, settings: Settings) -> tuple[str | None, float]:
+    """
+    Ritorna (motivo_chiusura | None, pnl_per_unità).
+    motivo: TAKE_PROFIT | STOP_LOSS | DTE_THRESHOLD
+    """
+    pnl = position_value - entry_net
+    basis = abs(entry_net)
+    if basis <= 0:
+        return (("DTE_THRESHOLD" if dte <= settings.CLOSE_DTE_THRESHOLD else None), pnl)
+    if entry_net < 0:  # strategia a credito
+        tp, sl = settings.TAKE_PROFIT_CREDIT_PCT * basis, settings.STOP_LOSS_CREDIT_PCT * basis
+    else:  # strategia a debito
+        tp, sl = settings.TAKE_PROFIT_DEBIT_PCT * basis, settings.STOP_LOSS_DEBIT_PCT * basis
+    if pnl >= tp:
+        return "TAKE_PROFIT", pnl
+    if pnl <= -sl:
+        return "STOP_LOSS", pnl
+    if dte <= settings.CLOSE_DTE_THRESHOLD:
+        return "DTE_THRESHOLD", pnl
+    return None, pnl
+
+
+# ---------------------------------------------------------------------- #
+# Modelli
+# ---------------------------------------------------------------------- #
+@dataclass
+class GroupLeg:
+    symbol: str
+    is_long: bool
+    ratio: int
+    avg_entry: float
+    current_price: float | None
+    bid: float | None = None
+    ask: float | None = None
+
+    @property
+    def mark(self) -> float | None:
+        if self.bid is not None and self.ask is not None and self.ask > 0:
+            return (self.bid + self.ask) / 2.0
+        return self.current_price
+
+
+@dataclass
+class PositionGroup:
+    underlying: str
+    expiration: date
+    legs: list[GroupLeg]
+    qty: int
+    trade: dict[str, Any] | None = None  # riga Supabase abbinata
+
+    @property
+    def dte(self) -> int:
+        return (self.expiration - datetime.now(timezone.utc).date()).days
+
+    @property
+    def symbols(self) -> set[str]:
+        return {leg.symbol for leg in self.legs}
+
+    @property
+    def strategy(self) -> str:
+        return (self.trade or {}).get("strategy") or "UNKNOWN"
+
+    @property
+    def entry_net(self) -> float:
+        if self.trade and self.trade.get("entry_price") is not None:
+            return float(self.trade["entry_price"])
+        return sum((leg.avg_entry if leg.is_long else -leg.avg_entry) * leg.ratio for leg in self.legs)
+
+    def position_value(self) -> float | None:
+        total = 0.0
+        for leg in self.legs:
+            mark = leg.mark
+            if mark is None:
+                return None
+            total += (mark if leg.is_long else -mark) * leg.ratio
+        return total
+
+
+@dataclass
+class RiskReport:
+    open_groups: list[PositionGroup] = field(default_factory=list)  # ancora aperte dopo la gestione
+    closed: list[str] = field(default_factory=list)
+    occupied_underlyings: set[str] = field(default_factory=set)  # posizioni + ordini pendenti
+
+    @property
+    def open_count(self) -> int:
+        return len(self.open_groups)
+
+
+# ---------------------------------------------------------------------- #
+# Risk manager
+# ---------------------------------------------------------------------- #
+class RiskManager:
+    def __init__(
+        self,
+        settings: Settings,
+        trading_client: TradingClient,
+        market: "MarketDataService",
+        executor: "OrderExecutor",
+        storage: "SupabaseStorage",
+    ) -> None:
+        self.s = settings
+        self.client = trading_client
+        self.market = market
+        self.executor = executor
+        self.storage = storage
+
+    # ---------------- Caricamento posizioni ---------------- #
+    def load_groups(self) -> list[PositionGroup]:
+        from src.data.market_data import parse_occ_symbol
+
+        positions: list[Position] = [p for p in self.client.get_all_positions() if p.asset_class == AssetClass.US_OPTION]
+        buckets: dict[tuple[str, date], list[Position]] = {}
+        for p in positions:
+            root, expiration, _, _ = parse_occ_symbol(p.symbol)
+            buckets.setdefault((root, expiration), []).append(p)
+
+        open_trades = self.storage.get_open_trades()
+        groups: list[PositionGroup] = []
+        for (root, expiration), plist in buckets.items():
+            qtys = [abs(int(float(p.qty))) for p in plist]
+            unit = reduce(math.gcd, qtys) or 1
+            legs = [
+                GroupLeg(
+                    symbol=p.symbol,
+                    is_long=p.side == PositionSide.LONG,
+                    ratio=abs(int(float(p.qty))) // unit,
+                    avg_entry=float(p.avg_entry_price),
+                    current_price=float(p.current_price) if p.current_price is not None else None,
+                )
+                for p in plist
+            ]
+            group = PositionGroup(underlying=root, expiration=expiration, legs=legs, qty=unit)
+            group.trade = self._match_trade(group, open_trades)
+            groups.append(group)
+
+        self._reconcile_orphan_trades(open_trades, groups)
+        return groups
+
+    @staticmethod
+    def _match_trade(group: PositionGroup, open_trades: list[dict[str, Any]]) -> dict[str, Any] | None:
+        for trade in open_trades:
+            legs = (trade.get("legs_json") or {}).get("legs", [])
+            symbols = {leg.get("symbol") for leg in legs}
+            if symbols and symbols == group.symbols:
+                return trade
+        return None
+
+    def _reconcile_orphan_trades(self, open_trades: list[dict[str, Any]], groups: list[PositionGroup]) -> None:
+        """Trade OPEN su Supabase senza posizione su Alpaca (scaduti, assegnati o chiusi a mano)."""
+        matched_ids = {g.trade["id"] for g in groups if g.trade}
+        for trade in open_trades:
+            if trade["id"] in matched_ids:
+                continue
+            logger.warning(
+                "Trade #{} {} {} OPEN su Supabase ma non presente su Alpaca: lo marco CLOSED (NOT_FOUND_IN_BROKER)",
+                trade["id"], trade.get("ticker"), trade.get("strategy"),
+            )
+            if not self.s.DRY_RUN:
+                self.storage.close_trade(trade["id"], exit_price=None, pnl=None, reason="NOT_FOUND_IN_BROKER")
+
+    def pending_order_underlyings(self) -> set[str]:
+        from src.data.market_data import parse_occ_symbol
+
+        underlyings: set[str] = set()
+        try:
+            orders = self.client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Impossibile leggere gli ordini aperti ({})", exc)
+            return underlyings
+        for order in orders:
+            symbols = [leg.symbol for leg in (order.legs or []) if leg.symbol] or ([order.symbol] if order.symbol else [])
+            for sym in symbols:
+                try:
+                    underlyings.add(parse_occ_symbol(sym)[0] if len(sym) > 15 else sym)
+                except ValueError:
+                    underlyings.add(sym)
+        return underlyings
+
+    # ---------------- Gestione ---------------- #
+    def manage_open_positions(self) -> RiskReport:
+        report = RiskReport()
+        logger.info("=== RISK MANAGER: controllo posizioni aperte ===")
+        groups = self.load_groups()
+        if not groups:
+            logger.info("Nessuna posizione in opzioni aperta")
+
+        # quote aggiornate per tutte le gambe in un'unica chiamata
+        all_symbols = sorted({leg.symbol for g in groups for leg in g.legs})
+        quotes = self.market.get_option_quotes(all_symbols)
+        for g in groups:
+            for leg in g.legs:
+                if leg.symbol in quotes:
+                    leg.bid, leg.ask = quotes[leg.symbol]
+
+        for g in groups:
+            value = g.position_value()
+            label = f"{g.underlying} {g.strategy} {g.expiration}"
+            if value is None:
+                logger.warning("[{}] quote non disponibili, salto la valutazione", label)
+                report.open_groups.append(g)
+                continue
+            reason, pnl_unit = evaluate_exit(g.entry_net, value, g.dte, self.s)
+            pnl_usd = pnl_unit * CONTRACT_MULTIPLIER * g.qty
+            basis = abs(g.entry_net)
+            pnl_pct = pnl_unit / basis if basis else 0.0
+            logger.info(
+                "[{}] x{} | entrata {:+.2f} | valore attuale {:+.2f} | P&L {:+.2f}/unità = ${:+,.0f} ({:+.0%} della base) | DTE {}",
+                label, g.qty, g.entry_net, value, pnl_unit, pnl_usd, pnl_pct, g.dte,
+            )
+            if g.trade and not self.s.DRY_RUN:
+                self.storage.update_trade(g.trade["id"], {"unrealized_pnl": round(pnl_usd, 2), "dte": g.dte})
+
+            if reason is None:
+                logger.info("[{}] nessuna condizione di uscita: mantengo la posizione", label)
+                report.open_groups.append(g)
+                continue
+
+            logger.warning("[{}] condizione di uscita {} -> chiudo la posizione", label, reason)
+            result = self.close_group(g, label)
+            if result.filled:
+                exit_net = result.fill_net_price if result.fill_net_price is not None else -value
+                realized = -(g.entry_net + exit_net) * CONTRACT_MULTIPLIER * g.qty
+                logger.success("[{}] CHIUSA ({}) P&L realizzato ${:+,.2f}", label, reason, realized)
+                report.closed.append(label)
+                if g.trade:
+                    self.storage.close_trade(g.trade["id"], exit_price=round(exit_net, 4), pnl=round(realized, 2), reason=reason)
+            else:
+                if result.dry_run:
+                    report.closed.append(f"{label} (DRY_RUN)")
+                report.open_groups.append(g)
+
+        report.occupied_underlyings = {g.underlying for g in report.open_groups} | self.pending_order_underlyings()
+        logger.info(
+            "Posizioni aperte dopo la gestione: {} / max {} | ticker occupati: {}",
+            report.open_count, self.s.MAX_OPEN_POSITIONS, sorted(report.occupied_underlyings) or "-",
+        )
+        return report
+
+    def close_group(self, group: PositionGroup, label: str) -> "ExecutionResult":
+        """Chiude il gruppo con un ordine MLEG; se rifiutato, ripiega su ordini single-leg."""
+        from src.execution.executor import ExecutionResult, OrderLegSpec
+
+        def to_spec(leg: GroupLeg) -> OrderLegSpec:
+            mark = leg.mark or 0.0
+            bid = leg.bid if leg.bid is not None else mark
+            ask = leg.ask if leg.ask is not None else mark
+            if leg.is_long:
+                return OrderLegSpec(leg.symbol, OrderSide.SELL, PositionIntent.SELL_TO_CLOSE, leg.ratio, bid, ask)
+            return OrderLegSpec(leg.symbol, OrderSide.BUY, PositionIntent.BUY_TO_CLOSE, leg.ratio, bid, ask)
+
+        specs = [to_spec(leg) for leg in group.legs]
+        result = self.executor.execute(specs, group.qty, f"CLOSE {label}")
+        if result.filled or result.dry_run or len(specs) == 1 or result.filled_qty > 0:
+            return result
+
+        logger.warning("[{}] chiusura MLEG non riuscita: provo gamba per gamba (prima le short)", label)
+        ordered = sorted(specs, key=lambda sp: sp.side != OrderSide.BUY)  # BUY_TO_CLOSE prima
+        total_net, all_filled = 0.0, True
+        for sp in ordered:
+            single = OrderLegSpec(sp.symbol, sp.side, sp.intent, 1, sp.bid, sp.ask)
+            r = self.executor.execute([single], group.qty * sp.ratio, f"CLOSE-LEG {sp.symbol}")
+            if not r.filled or r.fill_net_price is None:
+                all_filled = False
+                logger.error("[{}] gamba {} non chiusa: intervento manuale consigliato", label, sp.symbol)
+                break
+            total_net += r.fill_net_price * sp.ratio
+        return ExecutionResult(
+            filled=all_filled,
+            filled_qty=group.qty if all_filled else 0,
+            fill_net_price=total_net if all_filled else None,
+            status="filled" if all_filled else "partial_legs",
+            message="Chiusura gamba per gamba",
+        )

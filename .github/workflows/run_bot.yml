@@ -1,0 +1,58 @@
+name: Run Options Bot
+
+on:
+  schedule:
+    # Ogni 30 minuti, lun-ven, 14:00-20:30 UTC.
+    # Copre l'orario di mercato USA sia con l'ora solare (14:30-21:00 UTC) sia legale (13:30-20:00 UTC);
+    # gli orari esatti e i festivi sono gestiti in Python tramite TradingClient.get_clock().is_open.
+    - cron: "0,30 14-20 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "DRY_RUN: esegue la pipeline senza inviare ordini"
+        type: boolean
+        default: true
+      ignore_market_hours:
+        description: "Solo con DRY_RUN: esegui anche a mercato chiuso"
+        type: boolean
+        default: false
+
+# Un solo run alla volta: evita ordini duplicati se un run si sovrappone al successivo
+concurrency:
+  group: options-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m pytest -q
+
+      - name: Run bot
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Run manuale -> valore dell'input; run schedulato -> variabile di repository DRY_RUN (default "true")
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry_run) || vars.DRY_RUN || 'true' }}
+          IGNORE_MARKET_HOURS: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.ignore_market_hours) || 'false' }}
+          LOG_LEVEL: INFO
+        run: python -m src.main
