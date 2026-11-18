@@ -8,7 +8,7 @@
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232a78d6'/><path d='M6 22l6-7 5 4 9-10' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>" />
   <script src="https://cdn.tailwindcss.com/3.4.16"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.118.0/dist/umd/supabase.js"></script>
   <style>
     :root {
       color-scheme: light;
@@ -112,8 +112,8 @@
     </header>
 
     <div id="configBanner" class="card p-4 text-sm hidden" role="alert" style="border-color: var(--warn);">
-      <strong>Configurazione mancante.</strong>
-      <span class="t2">Apri <code>docs/index.html</code> e compila <code>SUPABASE_URL</code> e <code>SUPABASE_ANON_KEY</code> (vedi README).</span>
+      <strong>Configurazione da completare.</strong>
+      <span class="t2" id="configMsg"></span>
     </div>
     <div id="errorBanner" class="card p-4 text-sm hidden" role="alert" style="border-color: var(--bad);"></div>
 
@@ -229,12 +229,13 @@
   <script>
     // =====================================================================
     // CONFIGURAZIONE - compila questi due valori (Supabase -> Project Settings -> API)
-    //   SUPABASE_URL      : "Project URL", es. https://abcdefgh.supabase.co
-    //   SUPABASE_ANON_KEY : chiave PUBBLICA "anon" / "publishable".
-    //                       NON usare MAI la service_role / secret key qui: questa pagina è pubblica.
+    //   SUPABASE_URL      : "Project URL", es. https://abcdefgh.supabase.co  (NON una chiave)
+    //   SUPABASE_ANON_KEY : chiave PUBBLICA "publishable" (sb_publishable_...) o legacy "anon" (eyJ...).
+    //                       NON usare MAI la secret / service_role key qui: questa pagina è pubblica.
+    //                       (Se lo fai, la pagina si rifiuta di partire.)
     // =====================================================================
     const SUPABASE_URL = "https://YOUR-PROJECT.supabase.co";
-    const SUPABASE_ANON_KEY = "YOUR-ANON-KEY";
+    const SUPABASE_ANON_KEY = "sb_publishable_vfCYd9Uc7GIs7IeW2I86Lg_SxeSNoc4";
 
     const REFRESH_MS = 60_000;
 
@@ -273,7 +274,21 @@
     let chart = null;
     let db = null;
 
-    const configured = !SUPABASE_URL.includes("YOUR-PROJECT") && !SUPABASE_ANON_KEY.includes("YOUR-ANON-KEY");
+    // Controlli di configurazione: placeholder, URL al posto della chiave (o viceversa), chiave segreta esposta
+    function jwtRole(key) {
+      try { return JSON.parse(atob(key.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).role; } catch (_) { return null; }
+    }
+    function configProblem() {
+      if (SUPABASE_ANON_KEY.startsWith("sb_secret_") || jwtRole(SUPABASE_ANON_KEY) === "service_role")
+        return "<strong>Hai inserito la chiave SEGRETA</strong>: rimuovila subito da questo file, rigenerala su Supabase e usa la chiave <em>publishable</em> / <em>anon</em>.";
+      if (SUPABASE_URL.includes("YOUR-PROJECT") || SUPABASE_ANON_KEY.includes("YOUR-ANON-KEY"))
+        return "Apri <code>docs/index.html</code> e compila <code>SUPABASE_URL</code> e <code>SUPABASE_ANON_KEY</code> (vedi README).";
+      if (!/^https:\/\/\S+$/.test(SUPABASE_URL))
+        return "<code>SUPABASE_URL</code> deve essere l'indirizzo del progetto, es. <code>https://abcdefgh.supabase.co</code> (non una chiave).";
+      return null;
+    }
+    const problem = configProblem();
+    const configured = problem === null;
 
     // ------------------------------------------------------------------ //
     // Dati
@@ -568,6 +583,7 @@
     }
 
     if (!configured) {
+      $("configMsg").innerHTML = problem;
       $("configBanner").classList.remove("hidden");
       setLive(false, "Non configurato");
     } else {

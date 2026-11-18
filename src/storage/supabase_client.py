@@ -30,6 +30,16 @@ class SupabaseStorage:
         if not settings.supabase_configured:
             logger.warning("Supabase non configurato (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY): nessun dato verrà salvato")
             return
+        if not settings.SUPABASE_URL.startswith("https://"):
+            hint = " (sembra una chiave API, non un URL)" if settings.SUPABASE_URL.startswith(("sb_", "eyJ")) else ""
+            logger.error(
+                "SUPABASE_URL non valido{}: deve essere il 'Project URL', es. https://abcdefgh.supabase.co. "
+                "Nessun dato verrà salvato.", hint,
+            )
+            return
+        if settings.SUPABASE_SERVICE_ROLE_KEY.get_secret_value().startswith("sb_publishable_"):
+            logger.error("SUPABASE_SERVICE_ROLE_KEY contiene la chiave publishable: serve la chiave secret (sb_secret_...) per scrivere")
+            return
         try:
             from supabase import create_client
 
