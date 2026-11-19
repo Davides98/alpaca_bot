@@ -8,6 +8,7 @@ loggato e il bot prosegue normalmente.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, TypeVar
@@ -27,6 +28,7 @@ class SupabaseStorage:
     def __init__(self, settings: Settings) -> None:
         self.s = settings
         self.client: Any = None
+        self.error_count = 0
         if not settings.supabase_configured:
             logger.warning("Supabase non configurato (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY): nessun dato verrà salvato")
             return
@@ -59,8 +61,24 @@ class SupabaseStorage:
         try:
             return fn()
         except Exception as exc:  # noqa: BLE001 - mai far crashare il bot per il DB
+            self.error_count += 1
             logger.error("Supabase [{}] fallito: {}: {}", op, type(exc).__name__, str(exc)[:300])
             return default
+
+    # ------------------------------------------------------------------ #
+    # bot_runs: un record per OGNI run, anche a mercato chiuso o in errore
+    # ------------------------------------------------------------------ #
+    def log_run(self, run_id: str, status: str, message: str, dry_run: bool) -> None:
+        row = {
+            "timestamp": _now_iso(),
+            "run_id": run_id,
+            "status": status,
+            "message": message[:500],
+            "dry_run": dry_run,
+            "trigger": os.getenv("GITHUB_EVENT_NAME", "local"),
+        }
+        if self._safe("bot_runs.insert", lambda: self.client.table("bot_runs").insert(row).execute(), None):
+            logger.debug("Run {} registrato su bot_runs ({})", run_id, status)
 
     # ------------------------------------------------------------------ #
     # equity_snapshots

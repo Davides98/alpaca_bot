@@ -78,11 +78,31 @@ create index if not exists idx_screening_logs_ts on public.screening_logs ("time
 create index if not exists idx_screening_logs_run on public.screening_logs (run_id);
 
 -- ---------------------------------------------------------------------
+-- 4) bot_runs: "battito cardiaco" del bot, una riga per OGNI run
+--    (anche a mercato chiuso o in errore) per sapere che il bot è vivo.
+-- ---------------------------------------------------------------------
+create table if not exists public.bot_runs (
+    id           bigserial primary key,
+    "timestamp"  timestamptz not null default now(),
+    run_id       text not null,
+    status       text not null,          -- OK | MARKET_CLOSED | CONFIG_ERROR | AUTH_ERROR | ERROR
+    message      text,
+    dry_run      boolean not null default true,
+    trigger      text                    -- schedule | workflow_dispatch | local
+);
+
+create index if not exists idx_bot_runs_ts on public.bot_runs ("timestamp" desc);
+
+-- ---------------------------------------------------------------------
 -- Row Level Security
 -- ---------------------------------------------------------------------
 alter table public.equity_snapshots enable row level security;
 alter table public.trades           enable row level security;
 alter table public.screening_logs   enable row level security;
+alter table public.bot_runs         enable row level security;
+
+drop policy if exists "Allow public read" on public.bot_runs;
+create policy "Allow public read" on public.bot_runs for select to anon using (true);
 
 drop policy if exists "Allow public read" on public.equity_snapshots;
 create policy "Allow public read" on public.equity_snapshots for select to anon using (true);
@@ -96,9 +116,9 @@ create policy "Allow public read" on public.screening_logs for select to anon us
 -- Privilegi espliciti (alcuni progetti Supabase recenti non espongono
 -- automaticamente le nuove tabelle alla Data API).
 grant usage on schema public to anon, service_role;
-grant select on public.equity_snapshots, public.trades, public.screening_logs to anon;
-revoke insert, update, delete, truncate on public.equity_snapshots, public.trades, public.screening_logs from anon;
-grant all on public.equity_snapshots, public.trades, public.screening_logs to service_role;
+grant select on public.equity_snapshots, public.trades, public.screening_logs, public.bot_runs to anon;
+revoke insert, update, delete, truncate on public.equity_snapshots, public.trades, public.screening_logs, public.bot_runs from anon;
+grant all on public.equity_snapshots, public.trades, public.screening_logs, public.bot_runs to service_role;
 grant usage, select on all sequences in schema public to service_role;
 
 -- ---------------------------------------------------------------------
@@ -110,7 +130,7 @@ declare
     t text;
 begin
     if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
-        foreach t in array array['equity_snapshots', 'trades', 'screening_logs'] loop
+        foreach t in array array['equity_snapshots', 'trades', 'screening_logs', 'bot_runs'] loop
             if not exists (
                 select 1 from pg_publication_tables
                 where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = t

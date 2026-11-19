@@ -15,8 +15,11 @@ Esecuzione:  python -m src.main
 
 from __future__ import annotations
 
+import os
 import sys
 import uuid
+from dataclasses import dataclass
+from datetime import timezone
 from typing import Any
 
 from alpaca.common.exceptions import APIError
@@ -108,8 +111,55 @@ def plan_to_trade_row(plan: TradePlan, entry_price: float, qty: int, order_id: s
 # ---------------------------------------------------------------------- #
 # Main
 # ---------------------------------------------------------------------- #
-def run(settings: Settings) -> int:
-    run_id = uuid.uuid4().hex[:12]
+@dataclass
+class RunContext:
+    """Esito del run: viene sempre registrato su Supabase (tabella bot_runs) e su GitHub Actions."""
+
+    run_id: str
+    storage: SupabaseStorage
+    status: str = "STARTED"  # OK | MARKET_CLOSED | CONFIG_ERROR | AUTH_ERROR | ERROR
+    message: str = ""
+
+    def finish(self, status: str, message: str) -> None:
+        self.status, self.message = status, message
+
+
+def gh_annotation(level: str, title: str, message: str) -> None:
+    """Annotazione visibile nella pagina del run su GitHub Actions (::notice / ::warning / ::error)."""
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        clean = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::{level} title={title}::{clean}", flush=True)
+
+
+def write_step_summary(ctx: RunContext, settings: Settings) -> None:
+    path = os.getenv("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    icon = {"OK": "✅", "MARKET_CLOSED": "🌙"}.get(ctx.status, "❌")
+    db = "attivo" if ctx.storage.enabled and not ctx.storage.error_count else (
+        f"{ctx.storage.error_count} scritture fallite" if ctx.storage.enabled else "NON attivo: nessun dato salvato"
+    )
+    lines = [
+        f"### {icon} Options Bot - {ctx.status}",
+        "",
+        "| | |",
+        "|---|---|",
+        f"| Run | `{ctx.run_id}` |",
+        f"| Modalità | {'DRY_RUN' if settings.DRY_RUN else 'PAPER TRADING'} |",
+        f"| Esito | {ctx.message} |",
+        f"| Supabase | {db} |",
+        "",
+    ]
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+    except OSError:
+        pass
+
+
+def run(settings: Settings, ctx: RunContext) -> int:
+    run_id = ctx.run_id
+    storage = ctx.storage
     mode = "DRY_RUN (nessun ordine verrà inviato)" if settings.DRY_RUN else "PAPER TRADING (ordini reali sull'account paper)"
     logger.info("=" * 70)
     logger.info("Alpaca Options Bot | run {} | modalità: {}", run_id, mode)
@@ -117,9 +167,11 @@ def run(settings: Settings) -> int:
 
     if not PAPER_TRADING:  # salvaguardia: il bot non deve MAI operare su un conto reale
         logger.critical("PAPER_TRADING disattivato: esecuzione bloccata")
+        ctx.finish("CONFIG_ERROR", "PAPER_TRADING disattivato")
         return 1
     if not settings.alpaca_configured:
         logger.error("ALPACA_API_KEY / ALPACA_SECRET_KEY mancanti: configura .env o i GitHub Secrets")
+        ctx.finish("CONFIG_ERROR", "Chiavi Alpaca mancanti")
         return 1
 
     trading = TradingClient(
@@ -134,12 +186,13 @@ def run(settings: Settings) -> int:
         if settings.DRY_RUN and settings.IGNORE_MARKET_HOURS:
             logger.warning("Mercato CHIUSO, ma DRY_RUN + IGNORE_MARKET_HOURS: proseguo a scopo di test (quote potenzialmente stantie)")
         else:
-            logger.info("Mercato USA chiuso (prossima apertura: {}). Nessuna azione, esco.", clock.next_open)
+            next_open = clock.next_open.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            logger.info("Mercato USA chiuso (prossima apertura: {}). Nessuna azione, esco.", next_open)
+            ctx.finish("MARKET_CLOSED", f"Mercato chiuso, prossima apertura {next_open}. Nessuna operazione.")
             return 0
     else:
         logger.info("Mercato aperto (chiusura alle {})", clock.next_close)
 
-    storage = SupabaseStorage(settings)
     market = MarketDataService(settings)
     executor = OrderExecutor(trading, settings)
     risk = RiskManager(settings, trading, market, executor, storage)
@@ -205,20 +258,25 @@ def run(settings: Settings) -> int:
     # 6) Log screening
     storage.save_screening_logs([r.to_record() for r in output.rows], run_id)
 
-    logger.info("=" * 70)
-    logger.info(
-        "Fine run {} | posizioni chiuse: {} | nuovi trade {}: {} | posizioni aperte: {}",
-        run_id, len(report.closed), "simulati" if settings.DRY_RUN else "aperti", opened, report.open_count,
+    summary = (
+        f"Equity ${equity:,.0f} | {len(output.rows)} ticker analizzati, {len(output.ranked)} idonei | "
+        f"posizioni chiuse {len(report.closed)} | nuovi trade {'simulati' if settings.DRY_RUN else 'aperti'} {opened} | "
+        f"posizioni aperte {report.open_count}"
     )
     logger.info("=" * 70)
+    logger.info("Fine run {} | {}", run_id, summary)
+    logger.info("=" * 70)
+    ctx.finish("OK", summary)
     return 0
 
 
 def main() -> int:
     settings = get_settings()
     setup_logging(settings)
+    ctx = RunContext(run_id=uuid.uuid4().hex[:12], storage=SupabaseStorage(settings))
+    code = 1
     try:
-        return run(settings)
+        code = run(settings, ctx)
     except APIError as exc:
         status = getattr(exc, "status_code", None)
         if status in (401, 403):
@@ -226,12 +284,24 @@ def main() -> int:
                 "Alpaca ha rifiutato le credenziali (HTTP {}). Verifica di usare le chiavi dell'account PAPER "
                 "(iniziano con 'PK') e che siano state rigenerate dopo un reset dell'account.", status,
             )
+            ctx.finish("AUTH_ERROR", f"Credenziali Alpaca rifiutate (HTTP {status})")
         else:
             logger.error("Errore API Alpaca (HTTP {}): {}", status, str(exc)[:300])
-        return 1
+            ctx.finish("ERROR", f"Errore API Alpaca (HTTP {status})")
     except Exception as exc:  # noqa: BLE001
         logger.exception("Errore non gestito: {}: {}", type(exc).__name__, exc)
-        return 1
+        ctx.finish("ERROR", f"{type(exc).__name__}: {str(exc)[:200]}")
+    finally:
+        ctx.storage.log_run(ctx.run_id, ctx.status, ctx.message, settings.DRY_RUN)
+        level = {"OK": "notice", "MARKET_CLOSED": "notice"}.get(ctx.status, "error")
+        gh_annotation(level, f"Bot: {ctx.status}", ctx.message)
+        if not ctx.storage.enabled:
+            gh_annotation("warning", "Supabase non attivo",
+                          "Nessun dato salvato: controlla i secret SUPABASE_URL (https://xxxx.supabase.co) e SUPABASE_SERVICE_ROLE_KEY")
+        elif ctx.storage.error_count:
+            gh_annotation("warning", "Supabase", f"{ctx.storage.error_count} scritture fallite: vedi il log dello step 'Run bot'")
+        write_step_summary(ctx, settings)
+    return code
 
 
 if __name__ == "__main__":

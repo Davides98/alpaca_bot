@@ -135,9 +135,10 @@
         <div class="text-sm muted mt-1">vs chiusura precedente</div>
       </div>
       <div class="card p-5">
-        <div class="text-sm t2">Ultimo aggiornamento</div>
+        <div class="text-sm t2">Ultimo run del bot</div>
         <div class="text-xl font-semibold num mt-2" id="kpiUpdated">–</div>
-        <div class="text-sm muted mt-1" id="kpiUpdatedAgo">–</div>
+        <div class="text-sm mt-1" id="kpiRunStatus">–</div>
+        <div class="text-xs muted mt-1" id="kpiUpdatedAgo">–</div>
       </div>
     </section>
 
@@ -163,7 +164,7 @@
       </div>
       <div class="relative" style="height: 320px;">
         <canvas id="equityChart" role="img" aria-label="Grafico a linea dell'equity nel tempo"></canvas>
-        <div id="chartEmpty" class="absolute inset-0 hidden items-center justify-center text-sm muted">Nessuno snapshot disponibile: esegui il bot almeno una volta.</div>
+        <div id="chartEmpty" class="absolute inset-0 hidden items-center justify-center text-center text-sm muted px-6">Nessuno snapshot disponibile: esegui il bot almeno una volta.</div>
       </div>
       <details class="mt-4 text-sm">
         <summary class="cursor-pointer t2">Mostra i dati in tabella</summary>
@@ -319,17 +320,26 @@
       return data;
     }
 
+    // Ultimo run registrato dal bot (tabella bot_runs). Se la tabella non esiste ancora, ritorna null.
+    async function fetchLastRun() {
+      const { data, error } = await db.from("bot_runs").select("*").order("timestamp", { ascending: false }).limit(1);
+      if (error) { console.warn("bot_runs non disponibile:", error.message); return null; }
+      return data[0] ? { ...data[0], t: new Date(data[0].timestamp) } : null;
+    }
+
     async function loadAll() {
       try {
-        const [snapshots, tradesRes, screening] = await Promise.all([
+        const [snapshots, tradesRes, screening, lastRun] = await Promise.all([
           fetchAllSnapshots(),
           db.from("trades").select("*").order("created_at", { ascending: false }).limit(500),
           fetchLatestScreening(),
+          fetchLastRun(),
         ]);
         if (tradesRes.error) throw tradesRes.error;
         state.snapshots = snapshots.map((r) => ({ ...r, t: new Date(r.timestamp) }));
         state.trades = tradesRes.data;
         state.screening = screening;
+        state.lastRun = lastRun;
         $("errorBanner").classList.add("hidden");
         renderAll();
       } catch (err) {
@@ -343,7 +353,37 @@
     // ------------------------------------------------------------------ //
     // Render: KPI
     // ------------------------------------------------------------------ //
+    const RUN_STATUS = {
+      OK: { icon: "✓", label: "Completato", cls: "good" },
+      MARKET_CLOSED: { icon: "☾", label: "Mercato chiuso", cls: "t2" },
+      CONFIG_ERROR: { icon: "✕", label: "Errore di configurazione", cls: "bad" },
+      AUTH_ERROR: { icon: "✕", label: "Credenziali Alpaca rifiutate", cls: "bad" },
+      ERROR: { icon: "✕", label: "Errore", cls: "bad" },
+    };
+
+    function renderLastRun() {
+      const run = state.lastRun, last = state.snapshots.at(-1);
+      if (run) {
+        const st = RUN_STATUS[run.status] || { icon: "•", label: run.status, cls: "t2" };
+        $("kpiUpdated").textContent = dtFmt.format(run.t);
+        $("kpiRunStatus").innerHTML = `<span class="${st.cls}">${st.icon} ${esc(st.label)}</span>${run.dry_run ? ' <span class="muted text-xs">DRY_RUN</span>' : ""}`;
+        $("kpiRunStatus").title = run.message || "";
+        $("kpiUpdatedAgo").textContent = timeAgo(run.t) + (last ? ` · ultimo snapshot ${timeAgo(last.t)}` : "");
+      } else if (last) {
+        $("kpiUpdated").textContent = dtFmt.format(last.t);
+        $("kpiRunStatus").textContent = "";
+        $("kpiUpdatedAgo").textContent = timeAgo(last.t);
+      }
+      // Messaggio del grafico vuoto: distingue "bot mai partito" da "bot partito solo a mercato chiuso"
+      $("chartEmpty").textContent = !run
+        ? "Nessuno snapshot disponibile: esegui il bot almeno una volta."
+        : run.status === "MARKET_CLOSED"
+          ? `Il bot è attivo (ultimo run ${timeAgo(run.t)}), ma finora ha girato solo a mercato chiuso. Il primo snapshot arriverà al primo run con Wall Street aperta (15:30–22:00 ora italiana).`
+          : `Ultimo run: ${(RUN_STATUS[run.status] || {}).label || run.status} — ${run.message || ""}`;
+    }
+
     function renderKpis() {
+      renderLastRun();
       const last = state.snapshots.at(-1);
       if (!last) return;
       const equity = Number(last.equity), initial = Number(last.initial_capital);
@@ -353,8 +393,6 @@
       $("kpiReturnPct").innerHTML = `<span class="${cls(retPct)}">${arrow(retPct)}${fmtPct(retPct)}</span>`;
       $("kpiReturnUsd").innerHTML = `<span class="${cls(retUsd)}">${fmtUsd(retUsd)}</span>`;
       $("kpiDaily").innerHTML = `<span class="${cls(daily)}">${arrow(daily)}${fmtUsd(daily)}</span>`;
-      $("kpiUpdated").textContent = dtFmt.format(last.t);
-      $("kpiUpdatedAgo").textContent = timeAgo(last.t);
     }
 
     // ------------------------------------------------------------------ //
@@ -397,6 +435,7 @@
       const rows = visibleSnapshots();
       const isPct = state.unit === "pct";
       $("chartEmpty").style.display = rows.length ? "none" : "flex";
+      $("equityChart").style.visibility = rows.length ? "visible" : "hidden";  // niente assi finti senza dati
       $("chartSubtitle").textContent = isPct
         ? "Rendimento % rispetto al capitale iniziale, per ogni run del bot"
         : "Equity dell'account paper per ogni run del bot";
@@ -599,6 +638,7 @@
         .on("postgres_changes", { event: "*", schema: "public", table: "equity_snapshots" }, scheduleReload)
         .on("postgres_changes", { event: "*", schema: "public", table: "trades" }, scheduleReload)
         .on("postgres_changes", { event: "INSERT", schema: "public", table: "screening_logs" }, scheduleReload)
+        .on("postgres_changes", { event: "INSERT", schema: "public", table: "bot_runs" }, scheduleReload)
         .subscribe((status) => {
           if (status === "SUBSCRIBED") setLive(true, "Live");
           else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") setLive(false, `Aggiornamento ogni ${REFRESH_MS / 1000}s`);

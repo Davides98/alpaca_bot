@@ -166,7 +166,8 @@ TLT    | SIDEWAYS | LOW_IV  |    21 |  14.2 |    2.8% |    0.0 | no  | NO_TRADE 
 2. Quando il progetto è pronto, apri **SQL Editor → New query**.
 3. Incolla **tutto** il contenuto di [`supabase/schema.sql`](supabase/schema.sql) e premi **Run**. Lo script crea:
    - le tabelle `equity_snapshots`, `trades` e `screening_logs`, con i relativi indici;
-   - la **Row Level Security** su tutte e 3, con la sola policy `"Allow public read"` per il ruolo `anon`, quindi nessun INSERT/UPDATE/DELETE pubblico;
+   - la tabella `bot_runs`, con una riga per **ogni** run, anche a mercato chiuso o in errore, per sapere che il bot è vivo;
+   - la **Row Level Security** su tutte le tabelle, con la sola policy `"Allow public read"` per il ruolo `anon`, quindi nessun INSERT/UPDATE/DELETE pubblico;
    - l'abilitazione del **Realtime**, così la dashboard si aggiorna appena il bot scrive.
 
    Lo script è idempotente: puoi rieseguirlo senza problemi.
@@ -243,6 +244,17 @@ Gli ordini verranno inviati all'account **paper**. Prima di farlo, controlla nel
 Tutti i parametri di [`config/settings.py`](config/settings.py) sono sovrascrivibili via variabili d'ambiente, ad esempio `MAX_RISK_PER_TRADE_PCT=0.01` o `WATCHLIST=SPY,QQQ,IWM`.
 
 ---
+
+## "Il run è verde ma la dashboard è vuota"
+
+Un run verde significa solo che il bot non è andato in errore, non che abbia operato. Per capire cosa è successo:
+
+1. **Riepilogo del run su GitHub.** Apri il run: in alto trovi un box con l'esito (`OK`, `MARKET_CLOSED`, `AUTH_ERROR`…) e l'avviso **"Supabase non attivo"** se i secret Supabase sono sbagliati.
+2. **Card "Ultimo run del bot" nella dashboard.** Mostra l'ultimo run registrato in `bot_runs`. Se la card è vuota ma GitHub mostra run recenti, il bot non riesce a scrivere su Supabase: controlla i secret.
+3. **Motivi più comuni:**
+   - **mercato chiuso.** Il bot lavora solo dalle 15:30 alle 22:00 ora italiana, dal lunedì al venerdì; fuori orario registra `MARKET_CLOSED` e basta;
+   - **`DRY_RUN` attivo.** I run schedulati restano in DRY_RUN finché non imposti la variabile di repository `DRY_RUN=false`. In DRY_RUN vedrai snapshot e screening, ma **nessun trade**;
+   - **nessun candidato idoneo.** Lo vedi nella tabella "Ultimo screening", colonna "Strategia / motivo".
 
 ## Sicurezza
 
