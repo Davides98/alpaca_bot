@@ -103,7 +103,11 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     CHASE_INTERVAL_SEC: int = 15
     MAX_CHASE_ATTEMPTS: int = 3
-    CHASE_STEP: float = 0.01
+    CHASE_STEP: float = 0.01  # step MINIMO tra un tentativo e il successivo
+    # True: i tentativi vanno dal mid fino al prezzo "naturale" (vendi al bid / compri all'ask), così
+    # l'ultimo tentativo ha alta probabilità di esecuzione. False: step fissi da CHASE_STEP (spesso
+    # insufficienti sugli spread multi-leg, il cui naturale dista facilmente 0.10-0.30$ dal mid).
+    CHASE_TO_NATURAL: bool = True
     ORDER_POLL_SEC: float = 2.0
 
     # ------------------------------------------------------------------ #

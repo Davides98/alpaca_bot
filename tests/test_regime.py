@@ -218,3 +218,29 @@ def test_settings_watchlist_parsing() -> None:
     s = Settings(_env_file=None, WATCHLIST="spy, qqq ,IWM")
     assert s.WATCHLIST == ["SPY", "QQQ", "IWM"]
     assert Settings(_env_file=None).DRY_RUN is True
+
+
+# ---------------------------------------------------------------------- #
+# Executor: piano di chasing
+# ---------------------------------------------------------------------- #
+def test_price_ladder_credit_reaches_natural() -> None:
+    from src.execution.executor import price_ladder
+
+    # credit spread: mid -1.50 (incasso 1.50), naturale -1.30 (incasso 1.30)
+    ladder = price_ladder(-1.50, -1.30, attempts=3, min_step=0.01)
+    assert ladder[0] == -1.50
+    assert ladder[-1] == -1.30  # l'ultimo tentativo è al prezzo naturale
+    assert all(b > a for a, b in zip(ladder, ladder[1:]))  # sempre verso il mercato
+
+
+def test_price_ladder_tight_spread_respects_min_step_and_cap() -> None:
+    from src.execution.executor import price_ladder
+
+    ladder = price_ladder(2.00, 2.02, attempts=3, min_step=0.01)
+    assert ladder == [2.00, 2.01, 2.02]  # niente oltre il naturale
+
+
+def test_price_ladder_classic_mode() -> None:
+    from src.execution.executor import price_ladder
+
+    assert price_ladder(-1.50, -1.30, attempts=3, min_step=0.01, to_natural=False) == [-1.50, -1.49, -1.48, -1.47]

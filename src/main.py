@@ -224,7 +224,8 @@ def run(settings: Settings, ctx: RunContext) -> int:
             row.reason = "Idoneo"
 
     # 5) Nuovi trade
-    opened = 0
+    opened = 0  # ordini tentati
+    filled = 0  # ordini effettivamente eseguiti
     if slots <= 0:
         logger.info("Nessuno slot libero ({} posizioni aperte, max {}): non apro nuovi trade",
                     report.open_count, settings.MAX_OPEN_POSITIONS)
@@ -245,23 +246,35 @@ def run(settings: Settings, ctx: RunContext) -> int:
             cand.row.selected = True
             cand.row.reason = f"Selezionato: {plan.strategy.value} x{plan.qty}"
 
-            result = executor.execute(plan_to_order_legs(plan), plan.qty, f"OPEN {plan.ticker} {plan.strategy.value}")
+            # Le quote dello screening possono avere qualche minuto: le aggiorno subito prima dell'ordine
+            order_legs = plan_to_order_legs(plan)
+            fresh = market.get_option_quotes([leg.symbol for leg in order_legs])
+            for leg in order_legs:
+                bid, ask = fresh.get(leg.symbol, (0.0, 0.0))
+                if bid > 0 and ask >= bid:
+                    if (bid, ask) != (leg.bid, leg.ask):
+                        logger.info("Quote aggiornate {}: {:.2f}/{:.2f} -> {:.2f}/{:.2f}", leg.symbol, leg.bid, leg.ask, bid, ask)
+                    leg.bid, leg.ask = bid, ask
+
+            result = executor.execute(order_legs, plan.qty, f"OPEN {plan.ticker} {plan.strategy.value}")
             opened += 1
             if result.dry_run:
-                cand.row.reason += " (DRY_RUN, non inviato)"
+                cand.row.reason += f" (DRY_RUN, non inviato: {result.message})"
             elif result.filled_qty > 0 and result.fill_net_price is not None:
+                filled += 1
                 storage.insert_trade(plan_to_trade_row(plan, result.fill_net_price, result.filled_qty, result.order_id))
-                cand.row.reason += f" - eseguito {result.filled_qty} @ {result.fill_net_price:+.2f}"
+                cand.row.reason += f" - ESEGUITO {result.filled_qty} @ {result.fill_net_price:+.2f}"
             else:
-                cand.row.reason += " - non eseguito (chasing esaurito)"
+                cand.row.reason += f" - NON eseguito: {result.message}"
 
     # 6) Log screening
     storage.save_screening_logs([r.to_record() for r in output.rows], run_id)
 
     summary = (
         f"Equity ${equity:,.0f} | {len(output.rows)} ticker analizzati, {len(output.ranked)} idonei | "
-        f"posizioni chiuse {len(report.closed)} | nuovi trade {'simulati' if settings.DRY_RUN else 'aperti'} {opened} | "
-        f"posizioni aperte {report.open_count}"
+        f"posizioni chiuse {len(report.closed)} | "
+        + (f"ordini simulati {opened}" if settings.DRY_RUN else f"ordini inviati {opened}, eseguiti {filled}")
+        + f" | posizioni aperte prima del run {report.open_count}"
     )
     logger.info("=" * 70)
     logger.info("Fine run {} | {}", run_id, summary)

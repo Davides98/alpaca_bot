@@ -87,7 +87,7 @@ La scadenza scelta è quella più vicina al centro della finestra `MIN_DTE`–`M
   - credito: TP a +50% del credito, SL a −100% del credito;
   - debito: TP a +40%, SL a −30%;
   - sempre: chiusura con `DTE <= 7`.
-- **Ordini:** solo Limit `DAY`, al mid-price. Se l'ordine non viene eseguito entro 15 s, il prezzo si sposta di 0.01$ verso il mercato, al massimo 3 volte, poi l'ordine viene cancellato. Il chasing usa prima `replace_order_by_id` e, se Alpaca non lo accetta, ripiega su cancel + nuovo ordine.
+- **Ordini:** solo Limit `DAY`. Si parte dal mid-price; ogni 15 s senza esecuzione il prezzo si avvicina al mercato, con 3 tentativi distribuiti fino al **prezzo naturale** (vendi al bid, compri all'ask), poi l'ordine viene cancellato. Con `CHASE_TO_NATURAL=false` si torna agli step fissi da 0.01$. Il chasing usa prima `replace_order_by_id` e, se Alpaca non lo accetta, ripiega su cancel + nuovo ordine.
 - **Convenzione prezzi** (come Alpaca per gli ordini `MLEG`): un prezzo netto **positivo è un debito**, uno **negativo è un credito**. Nella dashboard: `1,42 CR` = credito incassato, `2,10 DB` = debito pagato.
 
 Esempio di ordine multi-leg generato (Bull Put Spread a credito):
@@ -196,7 +196,7 @@ TLT    | SIDEWAYS | LOW_IV  |    21 |  14.2 |    2.8% |    0.0 | no  | NO_TRADE 
    I secret non vengono passati ai workflow lanciati da pull request di fork, e GitHub li maschera automaticamente nei log.
 3. *(Facoltativo)* Nella tab **Variables** crea `DRY_RUN` con valore `true` o `false`: controlla i run **schedulati**. Se non la crei, i run schedulati restano in `DRY_RUN=true` per sicurezza.
 4. **Test manuale:** tab **Actions → Run Options Bot → Run workflow**. Lascia `dry_run` spuntato e premi *Run*. Per provare a mercato chiuso spunta anche `ignore_market_hours`.
-5. **Schedulazione:** il cron `7,37 13-20 * * 1-5` lancia il bot ogni 30 minuti dalle 13:07 alle 20:37 UTC, dal lunedì al venerdì. Questa fascia copre l'orario di Wall Street sia con l'ora solare sia con quella legale; fuori orario e nei festivi il bot esce subito grazie a `get_clock().is_open`.
+5. **Schedulazione:** il cron `3-59/10 13-20 * * 1-5` lancia il bot ogni 10 minuti dalle 13:03 alle 20:53 UTC, dal lunedì al venerdì. Questa fascia copre l'orario di Wall Street sia con l'ora solare sia con quella legale; fuori orario e nei festivi il bot esce subito grazie a `get_clock().is_open`.
 
 Note su GitHub Actions:
 

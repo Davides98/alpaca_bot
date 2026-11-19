@@ -55,6 +55,11 @@ class OrderLegSpec:
     def signed_mid(self) -> float:
         return self.mid * self.ratio if self.side == OrderSide.BUY else -self.mid * self.ratio
 
+    @property
+    def signed_natural(self) -> float:
+        """Prezzo 'naturale': si compra all'ask e si vende al bid (esecuzione quasi certa)."""
+        return self.ask * self.ratio if self.side == OrderSide.BUY else -self.bid * self.ratio
+
 
 @dataclass
 class ExecutionResult:
@@ -67,10 +72,38 @@ class ExecutionResult:
     attempts: int = 0
     message: str = ""
     history: list[str] = field(default_factory=list)
+    ladder: list[float] = field(default_factory=list)  # prezzi netti tentati
+    natural: float | None = None
 
 
 def net_mid(legs: list[OrderLegSpec]) -> float:
     return sum(leg.signed_mid for leg in legs)
+
+
+def net_natural(legs: list[OrderLegSpec]) -> float:
+    return sum(leg.signed_natural for leg in legs)
+
+
+def price_ladder(start: float, natural: float, attempts: int, min_step: float, to_natural: bool = True) -> list[float]:
+    """
+    Sequenza di prezzi netti per il chasing (sempre crescente = sempre più verso il mercato).
+
+    to_natural=True: i tentativi sono distribuiti in modo uniforme dal mid al prezzo naturale, così
+    l'ultimo tentativo è al naturale (bid per chi vende, ask per chi compra), con step minimo `min_step`.
+    to_natural=False: comportamento "classico", step fissi da `min_step` (spesso troppo piccoli sugli spread).
+    """
+    start = round_net(start)
+    ladder = [start]
+    if to_natural and natural > start:
+        for i in range(1, attempts + 1):
+            target = round_net(start + (natural - start) * i / attempts)
+            price = min(max(target, round_net(ladder[-1] + min_step)), round_net(natural))
+            if price > ladder[-1]:
+                ladder.append(price)
+    else:
+        for _ in range(attempts):
+            ladder.append(round_net(ladder[-1] + min_step))
+    return ladder
 
 
 def round_net(price: float) -> float:
@@ -95,56 +128,63 @@ class OrderExecutor:
             return ExecutionResult(filled=False, message="Ordine vuoto o qty < 1")
 
         start_price = round_net(net_mid(legs))
+        natural = round_net(net_natural(legs))
+        ladder = price_ladder(start_price, natural, self.s.MAX_CHASE_ATTEMPTS, self.s.CHASE_STEP, self.s.CHASE_TO_NATURAL)
         order_class = OrderClass.MLEG if len(legs) > 1 else OrderClass.SIMPLE
         kind = "DEBITO" if start_price > 0 else "CREDITO"
         legs_txt = ", ".join(f"{leg.intent.value} {leg.ratio}x {leg.symbol} (bid {leg.bid:.2f}/ask {leg.ask:.2f})" for leg in legs)
         logger.info(
-            "[{}] Ordine LIMIT {} qty {} @ netto {:.2f} {} | gambe: {}",
-            label, order_class.value.upper(), qty, abs(start_price), kind, legs_txt,
+            "[{}] Ordine LIMIT {} qty {} @ netto {:.2f} {} | naturale {:+.2f} | gambe: {}",
+            label, order_class.value.upper(), qty, abs(start_price), kind, natural, legs_txt,
+        )
+        logger.info(
+            "[{}] Piano di chasing ({} tentativi ogni {}s): {}",
+            label, len(ladder), self.s.CHASE_INTERVAL_SEC, " -> ".join(f"{p:+.2f}" for p in ladder),
         )
 
         if self.s.DRY_RUN:
-            final = start_price + self.s.CHASE_STEP * self.s.MAX_CHASE_ATTEMPTS
-            msg = (
-                f"DRY_RUN: ordine NON inviato. Chasing previsto da {start_price:+.2f} a {final:+.2f} "
-                f"({self.s.MAX_CHASE_ATTEMPTS} step da {self.s.CHASE_STEP:.2f} ogni {self.s.CHASE_INTERVAL_SEC}s)"
-            )
+            msg = f"DRY_RUN: ordine NON inviato. Chasing previsto {ladder[0]:+.2f} -> {ladder[-1]:+.2f} (naturale {natural:+.2f})"
             logger.warning("[{}] {}", label, msg)
-            return ExecutionResult(filled=False, dry_run=True, fill_net_price=start_price, message=msg)
+            return ExecutionResult(filled=False, dry_run=True, fill_net_price=start_price, message=msg, ladder=ladder, natural=natural)
 
-        return self._chase(legs, qty, start_price, order_class, label)
+        result = self._chase(legs, qty, ladder, order_class, label)
+        result.ladder, result.natural = ladder, natural
+        return result
 
     # ------------------------------------------------------------------ #
     # Chasing
     # ------------------------------------------------------------------ #
-    def _chase(self, legs: list[OrderLegSpec], qty: int, price: float, order_class: OrderClass, label: str) -> ExecutionResult:
+    def _chase(self, legs: list[OrderLegSpec], qty: int, ladder: list[float], order_class: OrderClass, label: str) -> ExecutionResult:
         result = ExecutionResult(filled=False)
         filled_total = 0
         fill_value = 0.0  # somma(prezzo netto * qty) delle esecuzioni parziali di ordini precedenti
+        price = ladder[0]
+        rejected = False
 
         try:
             order = self._submit(legs, qty, price, order_class)
         except APIError as exc:
-            result.message = f"Ordine rifiutato da Alpaca: {exc}"
+            result.message = f"Ordine RIFIUTATO da Alpaca: {str(exc)[:200]}"
             result.status = "rejected"
             logger.error("[{}] {}", label, result.message)
             return result
 
-        for attempt in range(self.s.MAX_CHASE_ATTEMPTS + 1):
+        for attempt in range(len(ladder)):
             result.attempts = attempt + 1
             result.history.append(f"{order.id}@{price:+.2f}")
             order = self._wait(order, self.s.CHASE_INTERVAL_SEC)
             if order.status == OrderStatus.FILLED:
                 break
             if order.status in (OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.EXPIRED):
+                rejected = order.status == OrderStatus.REJECTED
                 logger.error("[{}] Ordine {} terminato con stato {}", label, order.id, order.status.value)
                 break
-            if attempt == self.s.MAX_CHASE_ATTEMPTS:
-                logger.warning("[{}] Raggiunto MAX_CHASE_ATTEMPTS ({}), cancello l'ordine", label, self.s.MAX_CHASE_ATTEMPTS)
+            if attempt == len(ladder) - 1:
+                logger.warning("[{}] Ultimo prezzo del piano ({:+.2f}) non eseguito: cancello l'ordine", label, price)
                 order = self._cancel_and_wait(order)
                 break
 
-            new_price = round_net(price + self.s.CHASE_STEP)
+            new_price = ladder[attempt + 1]
             logger.info(
                 "[{}] Non eseguito in {}s (stato {}). Chase #{}: netto {:+.2f} -> {:+.2f}",
                 label, self.s.CHASE_INTERVAL_SEC, order.status.value, attempt + 1, price, new_price,
@@ -175,8 +215,10 @@ class OrderExecutor:
         elif filled_total > 0:
             result.message = f"Esecuzione PARZIALE {filled_total}/{qty} @ netto {result.fill_net_price:+.2f}"
             logger.warning("[{}] {}", label, result.message)
+        elif rejected:
+            result.message = "Ordine RIFIUTATO da Alpaca (verifica livello opzioni e buying power)"
         else:
-            result.message = "Nessuna esecuzione: ordine cancellato dopo il chasing"
+            result.message = f"Nessuna esecuzione: provati {ladder[0]:+.2f} -> {price:+.2f}, poi cancellato"
             logger.warning("[{}] {}", label, result.message)
         return result
 
