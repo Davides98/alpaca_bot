@@ -2,10 +2,11 @@ name: Run Options Bot
 
 on:
   schedule:
-    # Ogni 30 minuti, lun-ven, 14:00-20:30 UTC.
+    # Ogni 30 minuti, lun-ven, 13:07-20:37 UTC.
     # Copre l'orario di mercato USA sia con l'ora solare (14:30-21:00 UTC) sia legale (13:30-20:00 UTC);
     # gli orari esatti e i festivi sono gestiti in Python tramite TradingClient.get_clock().is_open.
-    - cron: "0,30 14-20 * * 1-5"
+    # Minuti :07 e :37 invece di :00/:30: GitHub ritarda o salta spesso i cron allo scoccare dell'ora.
+    - cron: "7,37 13-20 * * 1-5"
   workflow_dispatch:
     inputs:
       dry_run:

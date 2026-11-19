@@ -196,7 +196,7 @@ TLT    | SIDEWAYS | LOW_IV  |    21 |  14.2 |    2.8% |    0.0 | no  | NO_TRADE 
    I secret non vengono passati ai workflow lanciati da pull request di fork, e GitHub li maschera automaticamente nei log.
 3. *(Facoltativo)* Nella tab **Variables** crea `DRY_RUN` con valore `true` o `false`: controlla i run **schedulati**. Se non la crei, i run schedulati restano in `DRY_RUN=true` per sicurezza.
 4. **Test manuale:** tab **Actions → Run Options Bot → Run workflow**. Lascia `dry_run` spuntato e premi *Run*. Per provare a mercato chiuso spunta anche `ignore_market_hours`.
-5. **Schedulazione:** il cron `0,30 14-20 * * 1-5` lancia il bot ogni 30 minuti dalle 14:00 alle 20:30 UTC, dal lunedì al venerdì. Questa fascia copre l'orario di Wall Street sia con l'ora solare sia con quella legale; fuori orario e nei festivi il bot esce subito grazie a `get_clock().is_open`.
+5. **Schedulazione:** il cron `7,37 13-20 * * 1-5` lancia il bot ogni 30 minuti dalle 13:07 alle 20:37 UTC, dal lunedì al venerdì. Questa fascia copre l'orario di Wall Street sia con l'ora solare sia con quella legale; fuori orario e nei festivi il bot esce subito grazie a `get_clock().is_open`.
 
 Note su GitHub Actions:
 
