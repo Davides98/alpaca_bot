@@ -23,6 +23,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        env_ignore_empty=True,  # su GitHub un Secret/Variable non definito arriva come stringa vuota -> uso il default
         case_sensitive=True,
     )
 
@@ -40,6 +41,15 @@ class Settings(BaseSettings):
     DRY_RUN: bool = True
     IGNORE_MARKET_HOURS: bool = False  # efficace solo se DRY_RUN=true
     LOG_LEVEL: str = "INFO"
+
+    # ------------------------------------------------------------------ #
+    # Modalità sessione (un job resta attivo per tutta la sessione di mercato)
+    # ------------------------------------------------------------------ #
+    SESSION_MODE: bool = False  # False = run singolo (locale / manuale); True = ciclo continuo (GitHub schedulato)
+    REFRESH_INTERVAL_SEC: int = Field(default=60, ge=30, le=600)  # equity + P&L + TP/SL
+    TRADE_INTERVAL_MIN: int = Field(default=10, ge=1, le=120)  # screening + nuovi trade
+    SESSION_MAX_MINUTES: int = Field(default=340, ge=5, le=350)  # i job GitHub durano al massimo 360 min
+    SESSION_WAIT_FOR_OPEN_MIN: int = Field(default=65, ge=0, le=120)  # se l'apertura è vicina, la aspetta
 
     # ------------------------------------------------------------------ #
     # Universo e dati
@@ -74,7 +84,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # Screener
     # ------------------------------------------------------------------ #
-    MIN_OPPORTUNITY_SCORE: float = 30.0
+    MIN_OPPORTUNITY_SCORE: float = Field(default=30.0, ge=0, le=100)
 
     # ------------------------------------------------------------------ #
     # Strategie / contract picker
@@ -91,8 +101,8 @@ class Settings(BaseSettings):
     # Risk management
     # ------------------------------------------------------------------ #
     MAX_RISK_PER_TRADE_PCT: float = 0.02
-    MAX_OPEN_POSITIONS: int = 3
-    MAX_NEW_TRADES_PER_RUN: int = 1
+    MAX_OPEN_POSITIONS: int = Field(default=3, ge=1, le=20)
+    MAX_NEW_TRADES_PER_RUN: int = Field(default=1, ge=1, le=10)
     TAKE_PROFIT_CREDIT_PCT: float = 0.50  # +50% del credito massimo
     STOP_LOSS_CREDIT_PCT: float = 1.00  # -100% del credito incassato
     TAKE_PROFIT_DEBIT_PCT: float = 0.40  # +40% del debito pagato

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import timezone
@@ -26,6 +27,7 @@ from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, PositionIntent
 from loguru import logger
+from pydantic import ValidationError
 
 from config.settings import PAPER_TRADING, Settings, get_settings
 from src.analysis.screener import Screener
@@ -157,62 +159,57 @@ def write_step_summary(ctx: RunContext, settings: Settings) -> None:
         pass
 
 
-def run(settings: Settings, ctx: RunContext) -> int:
-    run_id = ctx.run_id
-    storage = ctx.storage
-    mode = "DRY_RUN (nessun ordine verrà inviato)" if settings.DRY_RUN else "PAPER TRADING (ordini reali sull'account paper)"
-    logger.info("=" * 70)
-    logger.info("Alpaca Options Bot | run {} | modalità: {}", run_id, mode)
-    logger.info("=" * 70)
+@dataclass
+class Services:
+    trading: TradingClient
+    market: MarketDataService
+    executor: OrderExecutor
+    risk: RiskManager
+    selector: StrategySelector
+    storage: SupabaseStorage
 
-    if not PAPER_TRADING:  # salvaguardia: il bot non deve MAI operare su un conto reale
-        logger.critical("PAPER_TRADING disattivato: esecuzione bloccata")
-        ctx.finish("CONFIG_ERROR", "PAPER_TRADING disattivato")
-        return 1
-    if not settings.alpaca_configured:
-        logger.error("ALPACA_API_KEY / ALPACA_SECRET_KEY mancanti: configura .env o i GitHub Secrets")
-        ctx.finish("CONFIG_ERROR", "Chiavi Alpaca mancanti")
-        return 1
 
-    trading = TradingClient(
-        api_key=settings.ALPACA_API_KEY.get_secret_value(),
-        secret_key=settings.ALPACA_SECRET_KEY.get_secret_value(),
-        paper=True,  # forzato: mai live
-    )
+@dataclass
+class SessionStats:
+    trading_cycles: int = 0
+    refresh_cycles: int = 0
+    orders_sent: int = 0
+    orders_filled: int = 0
+    positions_closed: int = 0
+    errors: int = 0
 
-    # 1) Mercato aperto?
-    clock = trading.get_clock()
-    if not clock.is_open:
-        if settings.DRY_RUN and settings.IGNORE_MARKET_HOURS:
-            logger.warning("Mercato CHIUSO, ma DRY_RUN + IGNORE_MARKET_HOURS: proseguo a scopo di test (quote potenzialmente stantie)")
-        else:
-            next_open = clock.next_open.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            logger.info("Mercato USA chiuso (prossima apertura: {}). Nessuna azione, esco.", next_open)
-            ctx.finish("MARKET_CLOSED", f"Mercato chiuso, prossima apertura {next_open}. Nessuna operazione.")
-            return 0
-    else:
-        logger.info("Mercato aperto (chiusura alle {})", clock.next_close)
 
-    market = MarketDataService(settings)
-    executor = OrderExecutor(trading, settings)
-    risk = RiskManager(settings, trading, market, executor, storage)
-    selector = StrategySelector(settings)
-
-    # 2) Account + snapshot equity
-    account = trading.get_account()
+def account_snapshot(svc: Services, verbose: bool = False) -> float:
+    """Legge l'account Alpaca, salva lo snapshot dell'equity e ritorna l'equity."""
+    account = svc.trading.get_account()
     equity = float(account.equity or 0)
     cash = float(account.cash or 0)
     last_equity = float(account.last_equity or equity)
-    logger.info("Account {} | options level {} | buying power opzioni ${:,.2f}",
-                account.status.value if account.status else "?",
-                getattr(account, "options_trading_level", "?"),
-                float(getattr(account, "options_buying_power", 0) or 0))
-    storage.save_equity_snapshot(equity, cash, last_equity)
+    if verbose:
+        logger.info("Account {} | options level {} | buying power opzioni ${:,.2f}",
+                    account.status.value if account.status else "?",
+                    getattr(account, "options_trading_level", "?"),
+                    float(getattr(account, "options_buying_power", 0) or 0))
+    svc.storage.save_equity_snapshot(equity, cash, last_equity)
+    return equity
 
-    # 3) Gestione posizioni aperte
-    report = risk.manage_open_positions()
 
-    # 4) Screening
+def refresh_cycle(svc: Services, stats: SessionStats) -> None:
+    """Ciclo leggero (ogni REFRESH_INTERVAL_SEC): P&L posizioni + controllo TP/SL/DTE."""
+    report = svc.risk.manage_open_positions()
+    stats.positions_closed += len(report.closed)
+    stats.refresh_cycles += 1
+
+
+def trading_cycle(settings: Settings, svc: Services, run_id: str, equity: float, stats: SessionStats) -> str:
+    """Ciclo completo: gestione posizioni + screening + nuovi trade. Ritorna il riepilogo testuale."""
+    storage, market, executor, selector = svc.storage, svc.market, svc.executor, svc.selector
+
+    # Gestione posizioni aperte
+    report = svc.risk.manage_open_positions()
+    stats.positions_closed += len(report.closed)
+
+    # Screening
     screener = Screener(settings, market)
     output = screener.run(occupied=report.occupied_underlyings)
     slots = min(settings.MAX_NEW_TRADES_PER_RUN, settings.MAX_OPEN_POSITIONS - report.open_count)
@@ -223,7 +220,7 @@ def run(settings: Settings, ctx: RunContext) -> int:
             row.selected = False
             row.reason = "Idoneo"
 
-    # 5) Nuovi trade
+    # Nuovi trade
     opened = 0  # ordini tentati
     filled = 0  # ordini effettivamente eseguiti
     if slots <= 0:
@@ -232,7 +229,7 @@ def run(settings: Settings, ctx: RunContext) -> int:
         for cand in output.ranked:
             cand.row.reason = "Idoneo ma limite posizioni raggiunto"
     elif not output.ranked:
-        logger.info("Nessun candidato idoneo in questo run: il bot resta fermo")
+        logger.info("Nessun candidato idoneo in questo ciclo: il bot resta fermo")
     else:
         logger.info("=== STRATEGY SELECTOR: {} candidati idonei, {} slot disponibili ===", len(output.ranked), slots)
         for cand in output.ranked:
@@ -267,15 +264,150 @@ def run(settings: Settings, ctx: RunContext) -> int:
             else:
                 cand.row.reason += f" - NON eseguito: {result.message}"
 
-    # 6) Log screening
     storage.save_screening_logs([r.to_record() for r in output.rows], run_id)
+    stats.orders_sent += opened
+    stats.orders_filled += filled
+    stats.trading_cycles += 1
 
-    summary = (
+    return (
         f"Equity ${equity:,.0f} | {len(output.rows)} ticker analizzati, {len(output.ranked)} idonei | "
         f"posizioni chiuse {len(report.closed)} | "
         + (f"ordini simulati {opened}" if settings.DRY_RUN else f"ordini inviati {opened}, eseguiti {filled}")
-        + f" | posizioni aperte prima del run {report.open_count}"
+        + f" | posizioni già aperte {report.open_count}"
     )
+
+
+def wait_for_open(settings: Settings, trading: TradingClient) -> bool:
+    """Modalità sessione: se l'apertura è vicina (<= SESSION_WAIT_FOR_OPEN_MIN) la aspetta. True se aperto."""
+    clock = trading.get_clock()
+    if clock.is_open:
+        return True
+    wait_s = (clock.next_open - clock.timestamp).total_seconds()
+    if 0 < wait_s <= settings.SESSION_WAIT_FOR_OPEN_MIN * 60:
+        logger.info("Mercato chiuso, apre tra {:.0f} minuti: attendo l'apertura", wait_s / 60)
+        time.sleep(wait_s + 15)
+        return trading.get_clock().is_open
+    return False
+
+
+def run_session(settings: Settings, ctx: RunContext, svc: Services) -> str:
+    """
+    Modalità sessione: un solo job resta attivo per tutta la sessione di mercato.
+      - ogni REFRESH_INTERVAL_SEC: snapshot equity + P&L posizioni + controllo TP/SL/DTE
+      - ogni TRADE_INTERVAL_MIN:  ciclo completo (screening + nuovi trade)
+    Termina a mercato chiuso o dopo SESSION_MAX_MINUTES (limite di durata dei job GitHub: 6 ore).
+    """
+    stats = SessionStats()
+    deadline = time.monotonic() + settings.SESSION_MAX_MINUTES * 60
+    next_trading = 0.0
+    consecutive_errors = 0
+    end_reason = ""
+    logger.info(
+        "Modalità SESSIONE: aggiornamento ogni {}s, trading ogni {} min, durata massima {} min",
+        settings.REFRESH_INTERVAL_SEC, settings.TRADE_INTERVAL_MIN, settings.SESSION_MAX_MINUTES,
+    )
+
+    while True:
+        tick = time.monotonic()
+        if tick >= deadline:
+            end_reason = "durata massima raggiunta, il prossimo run schedulato riprende"
+            break
+        try:
+            is_open = svc.trading.get_clock().is_open
+            test_mode = settings.DRY_RUN and settings.IGNORE_MARKET_HOURS and stats.trading_cycles == 0
+            if not is_open and not test_mode:
+                end_reason = "mercato chiuso"
+                break
+            equity = account_snapshot(svc, verbose=stats.trading_cycles == 0)
+            if tick >= next_trading:
+                logger.info("----- Ciclo di trading #{} -----", stats.trading_cycles + 1)
+                summary = trading_cycle(settings, svc, ctx.run_id, equity, stats)
+                logger.info("Ciclo di trading #{}: {}", stats.trading_cycles, summary)
+                svc.storage.log_run(ctx.run_id, "OK", f"[ciclo {stats.trading_cycles}] {summary}", settings.DRY_RUN)
+                next_trading = tick + settings.TRADE_INTERVAL_MIN * 60
+                if test_mode:
+                    end_reason = "test a mercato chiuso (DRY_RUN + IGNORE_MARKET_HOURS), un solo ciclo"
+                    break
+            else:
+                refresh_cycle(svc, stats)
+            consecutive_errors = 0
+        except APIError as exc:
+            if getattr(exc, "status_code", None) in (401, 403):
+                raise
+            consecutive_errors += 1
+            stats.errors += 1
+            logger.error("Errore API Alpaca nel ciclo ({}/5 consecutivi): {}", consecutive_errors, str(exc)[:300])
+        except Exception as exc:  # noqa: BLE001 - un ciclo fallito non deve fermare la sessione
+            consecutive_errors += 1
+            stats.errors += 1
+            logger.exception("Errore nel ciclo ({}/5 consecutivi): {}: {}", consecutive_errors, type(exc).__name__, exc)
+        if consecutive_errors >= 5:
+            raise RuntimeError("5 errori consecutivi: sessione interrotta")
+
+        time.sleep(max(1.0, settings.REFRESH_INTERVAL_SEC - (time.monotonic() - tick)))
+
+    trades_txt = (f"ordini simulati {stats.orders_sent}" if settings.DRY_RUN
+                  else f"ordini inviati {stats.orders_sent}, eseguiti {stats.orders_filled}")
+    return (
+        f"Sessione terminata ({end_reason}): {stats.trading_cycles} cicli di trading, "
+        f"{stats.refresh_cycles} aggiornamenti | {trades_txt} | posizioni chiuse {stats.positions_closed} | errori {stats.errors}"
+    )
+
+
+def run(settings: Settings, ctx: RunContext) -> int:
+    run_id = ctx.run_id
+    storage = ctx.storage
+    mode = "DRY_RUN (nessun ordine verrà inviato)" if settings.DRY_RUN else "PAPER TRADING (ordini reali sull'account paper)"
+    logger.info("=" * 70)
+    logger.info("Alpaca Options Bot | run {} | modalità: {} | {}", run_id, mode,
+                "SESSIONE continua" if settings.SESSION_MODE else "run singolo")
+    logger.info("=" * 70)
+
+    if not PAPER_TRADING:  # salvaguardia: il bot non deve MAI operare su un conto reale
+        logger.critical("PAPER_TRADING disattivato: esecuzione bloccata")
+        ctx.finish("CONFIG_ERROR", "PAPER_TRADING disattivato")
+        return 1
+    if not settings.alpaca_configured:
+        logger.error("ALPACA_API_KEY / ALPACA_SECRET_KEY mancanti: configura .env o i GitHub Secrets")
+        ctx.finish("CONFIG_ERROR", "Chiavi Alpaca mancanti")
+        return 1
+
+    trading = TradingClient(
+        api_key=settings.ALPACA_API_KEY.get_secret_value(),
+        secret_key=settings.ALPACA_SECRET_KEY.get_secret_value(),
+        paper=True,  # forzato: mai live
+    )
+
+    # Mercato aperto? (in modalità sessione aspetta l'apertura se manca poco)
+    is_open = wait_for_open(settings, trading) if settings.SESSION_MODE else trading.get_clock().is_open
+    if not is_open:
+        if settings.DRY_RUN and settings.IGNORE_MARKET_HOURS:
+            logger.warning("Mercato CHIUSO, ma DRY_RUN + IGNORE_MARKET_HOURS: proseguo a scopo di test (quote potenzialmente stantie)")
+        else:
+            clock = trading.get_clock()
+            next_open = clock.next_open.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            logger.info("Mercato USA chiuso (prossima apertura: {}). Nessuna azione, esco.", next_open)
+            ctx.finish("MARKET_CLOSED", f"Mercato chiuso, prossima apertura {next_open}. Nessuna operazione.")
+            return 0
+    else:
+        logger.info("Mercato aperto")
+
+    market = MarketDataService(settings)
+    executor = OrderExecutor(trading, settings)
+    svc = Services(
+        trading=trading,
+        market=market,
+        executor=executor,
+        risk=RiskManager(settings, trading, market, executor, storage),
+        selector=StrategySelector(settings),
+        storage=storage,
+    )
+
+    if settings.SESSION_MODE:
+        summary = run_session(settings, ctx, svc)
+    else:
+        equity = account_snapshot(svc, verbose=True)
+        summary = trading_cycle(settings, svc, run_id, equity, SessionStats())
     logger.info("=" * 70)
     logger.info("Fine run {} | {}", run_id, summary)
     logger.info("=" * 70)
@@ -284,8 +416,22 @@ def run(settings: Settings, ctx: RunContext) -> int:
 
 
 def main() -> int:
-    settings = get_settings()
+    try:
+        settings = get_settings()
+    except ValidationError as exc:
+        # Errore di configurazione (es. Secret/Variable con valore non valido): messaggio chiaro, senza valori segreti
+        problems = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors(include_input=False))
+        print(f"Configurazione non valida -> {problems}", file=sys.stderr)
+        gh_annotation("error", "Configurazione non valida", problems)
+        return 1
     setup_logging(settings)
+    logger.info(
+        "Parametri: MAX_NEW_TRADES_PER_RUN={} | MAX_OPEN_POSITIONS={} | MAX_RISK_PER_TRADE_PCT={:.2%} | "
+        "MIN_OPPORTUNITY_SCORE={:g} | PREFER_SINGLE_LEG_DEBIT={} | CHASE_TO_NATURAL={} | WATCHLIST={}",
+        settings.MAX_NEW_TRADES_PER_RUN, settings.MAX_OPEN_POSITIONS, settings.MAX_RISK_PER_TRADE_PCT,
+        settings.MIN_OPPORTUNITY_SCORE, settings.PREFER_SINGLE_LEG_DEBIT, settings.CHASE_TO_NATURAL,
+        ",".join(settings.WATCHLIST),
+    )
     ctx = RunContext(run_id=uuid.uuid4().hex[:12], storage=SupabaseStorage(settings))
     code = 1
     try:

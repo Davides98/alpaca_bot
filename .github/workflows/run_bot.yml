@@ -2,11 +2,14 @@ name: Run Options Bot
 
 on:
   schedule:
-    # Ogni 10 minuti, lun-ven, 13:03-20:53 UTC (minuti :03, :13, :23, :33, :43, :53).
-    # Copre l'orario di mercato USA sia con l'ora solare (14:30-21:00 UTC) sia legale (13:30-20:00 UTC);
-    # gli orari esatti e i festivi sono gestiti in Python tramite TradingClient.get_clock().is_open.
-    # Minuti sfalsati rispetto a :00/:30: GitHub ritarda o salta spesso i cron allo scoccare dell'ora.
-    - cron: "3-59/10 13-20 * * 1-5"
+    # MODALITA' SESSIONE: ogni run schedulato resta attivo per tutta la sessione di mercato
+    # (aggiorna equity/P&L ogni minuto, fa trading ogni 10 minuti) e si chiude alla chiusura di Wall Street.
+    # Questo cron orario fa solo da "guardiano": se la sessione e' gia' attiva il nuovo run resta in coda
+    # (vedi concurrency) e parte solo quando la sessione finisce; se non e' attiva, la avvia.
+    # Minuto :17 per evitare lo scoccare dell'ora (GitHub ritarda/salta spesso i cron a :00).
+    # Il bot attende l'apertura se manca meno di un'ora, quindi copre sia l'ora solare (apertura 14:30 UTC)
+    # sia quella legale USA (13:30 UTC); festivi e orari esatti li decide TradingClient.get_clock().
+    - cron: "17 13-20 * * 1-5"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -17,8 +20,14 @@ on:
         description: "Solo con DRY_RUN: esegui anche a mercato chiuso"
         type: boolean
         default: false
+      session:
+        description: "Sessione continua fino alla chiusura del mercato (altrimenti un solo ciclo)"
+        type: boolean
+        default: false
 
-# Un solo run alla volta: evita ordini duplicati se un run si sovrappone al successivo
+# Un solo run alla volta: evita ordini duplicati. Un run avviato mentre una sessione e' attiva resta
+# "in coda" e parte quando la sessione termina (GitHub tiene in coda al massimo 1 run: quelli in eccesso
+# compaiono come "cancelled", ed e' normale).
 concurrency:
   group: options-bot
   cancel-in-progress: false
@@ -29,7 +38,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 360  # massimo consentito da GitHub; la sessione si chiude da sola prima (SESSION_MAX_MINUTES)
     steps:
       # Actions fissate allo SHA completo del commit (richiesto dalla policy del repo):
       # un tag come "v7" può essere spostato, uno SHA no. Per aggiornare: nuovo SHA + commento versione.
@@ -60,4 +69,17 @@ jobs:
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry_run) || vars.DRY_RUN || 'true' }}
           IGNORE_MARKET_HOURS: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.ignore_market_hours) || 'false' }}
           LOG_LEVEL: INFO
+          # Run schedulato -> sessione continua; run manuale -> input "session" (default: un solo ciclo)
+          SESSION_MODE: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.session) || 'true' }}
+          REFRESH_INTERVAL_SEC: ${{ secrets.REFRESH_INTERVAL_SEC || vars.REFRESH_INTERVAL_SEC }}
+          TRADE_INTERVAL_MIN: ${{ secrets.TRADE_INTERVAL_MIN || vars.TRADE_INTERVAL_MIN }}
+          # Parametri di strategia/rischio: Secret se presente, altrimenti Variable, altrimenti default del codice
+          # (config/settings.py). Un valore vuoto viene ignorato.
+          MAX_NEW_TRADES_PER_RUN: ${{ secrets.MAX_NEW_TRADES_PER_RUN || vars.MAX_NEW_TRADES_PER_RUN }}
+          MAX_OPEN_POSITIONS: ${{ secrets.MAX_OPEN_POSITIONS || vars.MAX_OPEN_POSITIONS }}
+          MAX_RISK_PER_TRADE_PCT: ${{ secrets.MAX_RISK_PER_TRADE_PCT || vars.MAX_RISK_PER_TRADE_PCT }}
+          MIN_OPPORTUNITY_SCORE: ${{ secrets.MIN_OPPORTUNITY_SCORE || vars.MIN_OPPORTUNITY_SCORE }}
+          WATCHLIST: ${{ secrets.WATCHLIST || vars.WATCHLIST }}
+          PREFER_SINGLE_LEG_DEBIT: ${{ secrets.PREFER_SINGLE_LEG_DEBIT || vars.PREFER_SINGLE_LEG_DEBIT }}
+          CHASE_TO_NATURAL: ${{ secrets.CHASE_TO_NATURAL || vars.CHASE_TO_NATURAL }}
         run: python -m src.main

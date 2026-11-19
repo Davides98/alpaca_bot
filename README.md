@@ -196,13 +196,19 @@ TLT    | SIDEWAYS | LOW_IV  |    21 |  14.2 |    2.8% |    0.0 | no  | NO_TRADE 
    I secret non vengono passati ai workflow lanciati da pull request di fork, e GitHub li maschera automaticamente nei log.
 3. *(Facoltativo)* Nella tab **Variables** crea `DRY_RUN` con valore `true` o `false`: controlla i run **schedulati**. Se non la crei, i run schedulati restano in `DRY_RUN=true` per sicurezza.
 4. **Test manuale:** tab **Actions → Run Options Bot → Run workflow**. Lascia `dry_run` spuntato e premi *Run*. Per provare a mercato chiuso spunta anche `ignore_market_hours`.
-5. **Schedulazione:** il cron `3-59/10 13-20 * * 1-5` lancia il bot ogni 10 minuti dalle 13:03 alle 20:53 UTC, dal lunedì al venerdì. Questa fascia copre l'orario di Wall Street sia con l'ora solare sia con quella legale; fuori orario e nei festivi il bot esce subito grazie a `get_clock().is_open`.
+5. **Schedulazione in modalità sessione:** i cron di GitHub sono inaffidabili (ritardi anche di ore, slot saltati), quindi il bot non dipende da un cron frequente. Il cron `17 13-20 * * 1-5` parte una volta all'ora e avvia una **sessione continua** che resta attiva fino alla chiusura di Wall Street:
+   - **ogni 60 secondi** (`REFRESH_INTERVAL_SEC`): snapshot dell'equity, P&L delle posizioni e controllo di take profit, stop loss e DTE;
+   - **ogni 10 minuti** (`TRADE_INTERVAL_MIN`): ciclo completo di screening e nuovi trade;
+   - se l'apertura è vicina (meno di 65 minuti), la sessione la aspetta; festivi e orari esatti li decide `get_clock()`;
+   - un job GitHub dura al massimo 6 ore, mentre la sessione USA ne dura 6,5. La sessione si chiude quindi da sola dopo 340 minuti e il run orario successivo, già in coda, riprende fino alla chiusura.
+
+   I **run manuali** eseguono un solo ciclo, salvo che tu spunti `session`.
 
 Note su GitHub Actions:
 
-- I cron di GitHub possono partire con qualche minuto di ritardo.
+- `concurrency` impedisce che due run si sovrappongano, evitando ordini duplicati. Mentre una sessione è attiva, i run orari successivi restano **in coda** (GitHub ne tiene al massimo uno; gli altri compaiono come *cancelled*, ed è normale). Anche un run manuale lanciato durante una sessione resta in coda finché la sessione non finisce.
+- Per un repository pubblico i minuti di GitHub Actions sono gratuiti, quindi la sessione continua non ha costi.
 - GitHub **disattiva i workflow schedulati** dei repository pubblici dopo 60 giorni senza attività (commit). Basta riattivarli dalla tab Actions.
-- `concurrency` impedisce che due run si sovrappongano, evitando ordini duplicati.
 
 ---
 
@@ -241,7 +247,25 @@ Quando i log in DRY_RUN ti convincono:
 
 Gli ordini verranno inviati all'account **paper**. Prima di farlo, controlla nella dashboard di Alpaca (account Paper → *Account* → *Options*) che il livello di trading in opzioni sia **3**, necessario per spread e Iron Condor. Con livello 1–2 imposta `PREFER_SINGLE_LEG_DEBIT=true`; i credit spread verranno comunque rifiutati.
 
-Tutti i parametri di [`config/settings.py`](config/settings.py) sono sovrascrivibili via variabili d'ambiente, ad esempio `MAX_RISK_PER_TRADE_PCT=0.01` o `WATCHLIST=SPY,QQQ,IWM`.
+### Parametri configurabili da GitHub (senza toccare il codice)
+
+Vai in **Settings → Secrets and variables → Actions** e crea un **Secret** o una **Variable** con uno di questi nomi. Se esistono entrambi vince il Secret; se non c'è nessuno dei due vale il default.
+
+| Nome | Default | Significato |
+|---|---|---|
+| `MAX_NEW_TRADES_PER_RUN` | `1` | nuovi trade aperti al massimo per ogni run (1–10) |
+| `MAX_OPEN_POSITIONS` | `3` | posizioni aperte al massimo in totale (1–20) |
+| `MAX_RISK_PER_TRADE_PCT` | `0.02` | rischio massimo per trade come frazione dell'equity (`0.01` = 1%, massimo `0.10`) |
+| `MIN_OPPORTUNITY_SCORE` | `30` | score minimo dello screener per considerare un ticker idoneo (0–100) |
+| `WATCHLIST` | `SPY,QQQ,IWM,TLT,GLD,AAPL,MSFT,NVDA,AMZN,AMD` | ticker da analizzare, separati da virgola |
+| `PREFER_SINGLE_LEG_DEBIT` | `false` | `true` = Long Call/Put invece dei debit spread |
+| `CHASE_TO_NATURAL` | `true` | `false` = chasing a step fissi da 0.01$ invece che fino al prezzo naturale |
+
+> 💡 Per questi valori conviene la tab **Variables**: puoi rileggerli e modificarli quando vuoi. I **Secrets** invece non si possono rileggere, e GitHub nasconde il loro valore (`***`) ovunque compaia nei log: un secret `2` può oscurare ogni "2" del log.
+
+All'inizio di ogni run il log stampa i parametri effettivi (`Parametri: MAX_NEW_TRADES_PER_RUN=...`), così puoi verificare che il valore sia stato letto. Un valore non valido, per esempio `MAX_OPEN_POSITIONS=abc`, ferma il run con un errore chiaro.
+
+In locale gli stessi nomi si impostano nel file `.env`. Tutti gli altri parametri di [`config/settings.py`](config/settings.py) sono sovrascrivibili via variabili d'ambiente.
 
 ---
 
