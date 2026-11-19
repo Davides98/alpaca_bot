@@ -15,7 +15,7 @@ on:
       dry_run:
         description: "DRY_RUN: esegue la pipeline senza inviare ordini"
         type: boolean
-        default: true
+        default: false
       ignore_market_hours:
         description: "Solo con DRY_RUN: esegui anche a mercato chiuso"
         type: boolean
@@ -65,8 +65,8 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          # Run manuale -> valore dell'input; run schedulato -> variabile di repository DRY_RUN (default "true")
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry_run) || vars.DRY_RUN || 'true' }}
+          # Run manuale -> valore dell'input; run schedulato -> variabile di repository DRY_RUN (default "false" = ordini paper)
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry_run) || vars.DRY_RUN || 'false' }}
           IGNORE_MARKET_HOURS: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.ignore_market_hours) || 'false' }}
           LOG_LEVEL: INFO
           # Run schedulato -> sessione continua; run manuale -> input "session" (default: un solo ciclo)

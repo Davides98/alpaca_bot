@@ -217,7 +217,7 @@ def test_exit_dte_threshold(settings: Settings) -> None:
 def test_settings_watchlist_parsing() -> None:
     s = Settings(_env_file=None, WATCHLIST="spy, qqq ,IWM")
     assert s.WATCHLIST == ["SPY", "QQQ", "IWM"]
-    assert Settings(_env_file=None).DRY_RUN is True
+    assert Settings(_env_file=None).DRY_RUN is False
 
 
 # ---------------------------------------------------------------------- #

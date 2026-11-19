@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # Modalità di esecuzione
     # ------------------------------------------------------------------ #
-    DRY_RUN: bool = True
+    DRY_RUN: bool = False  # False = invia ordini (sempre e solo sull'account PAPER)
     IGNORE_MARKET_HOURS: bool = False  # efficace solo se DRY_RUN=true
     LOG_LEVEL: str = "INFO"
 

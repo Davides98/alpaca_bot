@@ -135,7 +135,7 @@ pip install -r requirements.txt
 cp .env.example .env      # Windows: copy .env.example .env
 ```
 
-Apri `.env` e compila almeno `ALPACA_API_KEY` e `ALPACA_SECRET_KEY`. Lascia `DRY_RUN=true`. Supabase è facoltativo: se non lo configuri, il bot funziona lo stesso e lo segnala nei log.
+Apri `.env` e compila almeno `ALPACA_API_KEY` e `ALPACA_SECRET_KEY`. Per il primo test imposta `DRY_RUN=true` (il default è `false`, cioè ordini sull'account paper). Supabase è facoltativo: se non lo configuri, il bot funziona lo stesso e lo segnala nei log.
 
 ### Test
 
@@ -194,8 +194,8 @@ TLT    | SIDEWAYS | LOW_IV  |    21 |  14.2 |    2.8% |    0.0 | no  | NO_TRADE 
    | `SUPABASE_SERVICE_ROLE_KEY` | chiave service_role / secret di Supabase |
 
    I secret non vengono passati ai workflow lanciati da pull request di fork, e GitHub li maschera automaticamente nei log.
-3. *(Facoltativo)* Nella tab **Variables** crea `DRY_RUN` con valore `true` o `false`: controlla i run **schedulati**. Se non la crei, i run schedulati restano in `DRY_RUN=true` per sicurezza.
-4. **Test manuale:** tab **Actions → Run Options Bot → Run workflow**. Lascia `dry_run` spuntato e premi *Run*. Per provare a mercato chiuso spunta anche `ignore_market_hours`.
+3. *(Facoltativo)* Nella tab **Variables** crea `DRY_RUN` con valore `true` o `false`: controlla i run **schedulati**. Se non la crei, i run schedulati usano `DRY_RUN=false`, cioè inviano ordini sull'account paper. Crea `DRY_RUN=true` per metterli in pausa senza fermare la dashboard.
+4. **Test manuale:** tab **Actions → Run Options Bot → Run workflow**. Per una prova senza ordini spunta `dry_run` (di default è spento) e premi *Run*. Per provare a mercato chiuso spunta anche `ignore_market_hours`.
 5. **Schedulazione in modalità sessione:** i cron di GitHub sono inaffidabili (ritardi anche di ore, slot saltati), quindi il bot non dipende da un cron frequente. Il cron `17 13-20 * * 1-5` parte una volta all'ora e avvia una **sessione continua** che resta attiva fino alla chiusura di Wall Street:
    - **ogni 60 secondi** (`REFRESH_INTERVAL_SEC`): snapshot dell'equity, P&L delle posizioni e controllo di take profit, stop loss e DTE;
    - **ogni 10 minuti** (`TRADE_INTERVAL_MIN`): ciclo completo di screening e nuovi trade;
@@ -277,7 +277,7 @@ Un run verde significa solo che il bot non è andato in errore, non che abbia op
 2. **Card "Ultimo run del bot" nella dashboard.** Mostra l'ultimo run registrato in `bot_runs`. Se la card è vuota ma GitHub mostra run recenti, il bot non riesce a scrivere su Supabase: controlla i secret.
 3. **Motivi più comuni:**
    - **mercato chiuso.** Il bot lavora solo dalle 15:30 alle 22:00 ora italiana, dal lunedì al venerdì; fuori orario registra `MARKET_CLOSED` e basta;
-   - **`DRY_RUN` attivo.** I run schedulati restano in DRY_RUN finché non imposti la variabile di repository `DRY_RUN=false`. In DRY_RUN vedrai snapshot e screening, ma **nessun trade**;
+   - **`DRY_RUN` attivo.** Se hai creato la variabile di repository `DRY_RUN=true`, o hai spuntato `dry_run` in un run manuale, vedrai snapshot e screening ma **nessun trade**;
    - **nessun candidato idoneo.** Lo vedi nella tabella "Ultimo screening", colonna "Strategia / motivo".
 
 ## Sicurezza
