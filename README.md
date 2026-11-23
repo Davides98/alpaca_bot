@@ -85,7 +85,7 @@ La scadenza scelta è quella più vicina al centro della finestra `MIN_DTE`–`M
 - **Sizing:** `qty = floor(equity × 2% / perdita massima per contratto)`. Se anche un solo contratto supera il budget, il trade viene scartato.
 - **Uscite:**
   - credito: TP a +50% del credito, SL a −100% del credito;
-  - debito: TP a +40%, SL a −30%;
+  - debito: TP a +40%, SL a −50%;
   - sempre: chiusura con `DTE <= 7`.
 - **Ordini:** solo Limit `DAY`. Si parte dal mid-price; ogni 15 s senza esecuzione il prezzo si avvicina al mercato, con 3 tentativi distribuiti fino al **prezzo naturale** (vendi al bid, compri all'ask), poi l'ordine viene cancellato. Con `CHASE_TO_NATURAL=false` si torna agli step fissi da 0.01$. Il chasing usa prima `replace_order_by_id` e, se Alpaca non lo accetta, ripiega su cancel + nuovo ordine.
 - **Protezioni sull'esecuzione** (introdotte dopo i trade QQQ e GLD del 23/11/2026, chiusi in forte perdita nei primi minuti di mercato per quote larghissime):
@@ -305,7 +305,7 @@ Vai in **Settings → Secrets and variables → Actions** e crea un **Secret** o
 | `TAKE_PROFIT_CREDIT_PCT` | `0.50` | chiude una posizione a credito quando il guadagno arriva a questa % del credito incassato (es. `0.30` o `30%`) |
 | `STOP_LOSS_CREDIT_PCT` | `1.00` | chiude una posizione a credito quando la perdita arriva a questa % del credito |
 | `TAKE_PROFIT_DEBIT_PCT` | `0.40` | chiude una posizione a debito quando il guadagno arriva a questa % del debito pagato |
-| `STOP_LOSS_DEBIT_PCT` | `0.30` | chiude una posizione a debito quando la perdita arriva a questa % del debito |
+| `STOP_LOSS_DEBIT_PCT` | `0.50` | chiude una posizione a debito quando la perdita arriva a questa % del debito |
 | `NO_TRADE_AFTER_OPEN_MIN` | `15` | minuti dopo l'apertura senza nuovi trade né take profit / stop loss (quote inaffidabili) |
 | `NO_NEW_TRADES_BEFORE_CLOSE_MIN` | `10` | minuti prima della chiusura senza nuovi trade |
 | `MAX_SLIPPAGE_PCT_OF_WIDTH` | `0.10` | slippage massima rispetto al mid, in frazione della larghezza dello spread (o del premio) |

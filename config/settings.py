@@ -113,7 +113,7 @@ class Settings(BaseSettings):
     TAKE_PROFIT_CREDIT_PCT: float = Field(default=0.50, gt=0, le=1.0)  # +50% del credito (il massimo teorico è 100%)
     STOP_LOSS_CREDIT_PCT: float = Field(default=1.00, gt=0, le=5.0)  # -100% del credito incassato
     TAKE_PROFIT_DEBIT_PCT: float = Field(default=0.40, gt=0, le=10.0)  # +40% del debito pagato
-    STOP_LOSS_DEBIT_PCT: float = Field(default=0.30, gt=0, le=1.0)  # -30% del debito pagato (il massimo è 100%)
+    STOP_LOSS_DEBIT_PCT: float = Field(default=0.50, gt=0, le=1.0)  # -50% del debito pagato (il massimo è 100%)
     # Lo stop loss scatta solo se la condizione si ripete per N controlli consecutivi (modalità sessione):
     # evita di chiudere su un singolo prezzo anomalo.
     STOP_LOSS_CONFIRM_CHECKS: int = Field(default=2, ge=1, le=10)

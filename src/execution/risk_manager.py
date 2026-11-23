@@ -4,7 +4,7 @@ Modulo 5b - Risk Management.
 - Position sizing: qty = floor(rischio_massimo / max_loss_per_contratto).
 - Gestione posizioni aperte (prima di cercare nuovi trade):
     1. Take Profit  (+50% del credito massimo / +40% del debito pagato)
-    2. Stop Loss    (-100% del credito incassato / -30% del debito pagato)
+    2. Stop Loss    (-100% del credito incassato / -50% del debito pagato)
     3. Protezione assegnazione: DTE <= CLOSE_DTE_THRESHOLD
 
 Protezioni sull'esecuzione delle uscite:
