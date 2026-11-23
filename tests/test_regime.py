@@ -205,7 +205,8 @@ def test_exit_credit_stop_loss(settings: Settings) -> None:
 
 def test_exit_debit_rules(settings: Settings) -> None:
     assert evaluate_exit(2.00, 2.85, 30, settings)[0] == "TAKE_PROFIT"  # +42.5%
-    assert evaluate_exit(2.00, 1.35, 30, settings)[0] == "STOP_LOSS"  # -32.5%
+    assert evaluate_exit(2.00, 0.95, 30, settings)[0] == "STOP_LOSS"  # -52.5%
+    assert evaluate_exit(2.00, 1.35, 30, settings)[0] is None  # -32.5%: con lo stop al 50% si tiene
     assert evaluate_exit(2.00, 2.10, 30, settings)[0] is None
 
 
