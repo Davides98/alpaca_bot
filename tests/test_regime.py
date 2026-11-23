@@ -267,3 +267,42 @@ def test_percent_parsing_and_bounds() -> None:
         Settings(_env_file=None, TAKE_PROFIT_CREDIT_PCT="150%")  # oltre il massimo teorico del credito
     with pytest.raises(ValidationError):
         Settings(_env_file=None, TAKE_PROFIT_CREDIT_PCT="0")
+
+
+def test_bot_status_row_for_dashboard() -> None:
+    """La riga bot_status contiene intervalli, scadenza sessione e orari Alpaca in UTC ISO."""
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from src.main import BotStatus
+
+    class FakeStorage:
+        def __init__(self) -> None:
+            self.rows: list[dict] = []
+
+        def update_bot_status(self, fields: dict) -> None:
+            self.rows.append(fields)
+
+    s = Settings(_env_file=None, TRADE_INTERVAL_MIN=5, REFRESH_INTERVAL_SEC=45, SESSION_MODE=True)
+    storage = FakeStorage()
+    status = BotStatus(storage, s, "abc123")  # type: ignore[arg-type]
+    start = datetime(2026, 11, 23, 14, 31, tzinfo=timezone.utc)
+    status.session_started_at = start
+    status.session_deadline = start + timedelta(minutes=s.SESSION_MAX_MINUTES)
+    clock = SimpleNamespace(
+        is_open=True,
+        next_open=datetime(2026, 11, 24, 9, 30, tzinfo=timezone(timedelta(hours=-5))),
+        next_close=datetime(2026, 11, 23, 16, 0, tzinfo=timezone(timedelta(hours=-5))),
+        timestamp=start,
+    )
+    status.publish("RUNNING", clock, "ok")
+    row = storage.rows[-1]
+    assert row["state"] == "RUNNING" and row["run_id"] == "abc123"
+    assert row["trade_interval_min"] == 5 and row["refresh_interval_sec"] == 45
+    assert row["market_is_open"] is True
+    assert row["market_next_close"] == "2026-11-23T21:00:00+00:00"
+    assert row["market_next_open"] == "2026-11-24T14:30:00+00:00"
+    assert row["session_deadline"] == (start + timedelta(minutes=s.SESSION_MAX_MINUTES)).isoformat()
+
+    status.publish("STOPPED", None, "fine")  # senza clock non sovrascrive gli orari di mercato
+    assert "market_next_open" not in storage.rows[-1]

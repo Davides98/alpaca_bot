@@ -12,6 +12,7 @@
 --      Repository access: solo questo repository | Permissions -> Actions: Read and write.
 --
 -- COME SI USA
+--   0. Dashboard Supabase -> Database -> Extensions: attiva "pg_cron" e "pg_net".
 --   1. Incolla tutto questo file nel SQL Editor di Supabase e premi Run.
 --   2. In una NUOVA query del SQL Editor (non in questo file!) salva il token nel Vault cifrato:
 --        select vault.create_secret('IL_TUO_TOKEN', 'github_dispatch_token');
@@ -21,11 +22,20 @@
 --   Rieseguire questo file è sicuro: aggiorna funzione e job senza duplicarli.
 -- =====================================================================
 
--- Estensioni (incluse nel piano gratuito; sintassi dalla documentazione Supabase)
-create extension if not exists pg_cron with schema pg_catalog;
-grant usage on schema cron to postgres;
-grant all privileges on all tables in schema cron to postgres;
-create extension if not exists pg_net with schema extensions;
+-- Estensioni pg_cron e pg_net (incluse nel piano gratuito).
+-- Vanno attivate DAL PANNELLO di Supabase, non da qui: creare pg_cron via SQL fa partire uno script
+-- interno di Supabase che su alcuni progetti fallisce con "dependent privileges exist".
+--   Dashboard -> Database -> Extensions -> cerca "pg_cron" -> attiva; poi cerca "pg_net" -> attiva.
+-- Questo blocco controlla soltanto che siano attive e, se mancano, si ferma con un messaggio chiaro.
+do $$
+begin
+    if not exists (select 1 from pg_extension where extname = 'pg_cron') then
+        raise exception 'pg_cron non attivo: Dashboard -> Database -> Extensions -> attiva "pg_cron", poi riesegui questo file';
+    end if;
+    if not exists (select 1 from pg_extension where extname = 'pg_net') then
+        raise exception 'pg_net non attivo: Dashboard -> Database -> Extensions -> attiva "pg_net", poi riesegui questo file';
+    end if;
+end $$;
 
 -- ---------------------------------------------------------------------
 -- A) Funzione "guardiano" in uno schema NON esposto dall'API pubblica

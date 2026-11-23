@@ -90,6 +90,14 @@
     .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
     .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
     .live-dot.on { background: var(--good); box-shadow: 0 0 0 3px rgba(12,163,12,.18); }
+    .pill.good { color: var(--good); }
+    .pill.bad { color: var(--bad); }
+    .pill.warn { color: var(--warn); }
+    .bar { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+    .bar > span { display: block; height: 100%; border-radius: 3px; background: var(--series); transition: width .9s linear; }
+    .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; }
+    .kv dt { color: var(--muted); white-space: nowrap; }
+    .kv dd { color: var(--text-2); min-width: 0; }
   </style>
 </head>
 <body class="min-h-screen">
@@ -139,6 +147,32 @@
         <div class="text-xl font-semibold num mt-2" id="kpiUpdated">–</div>
         <div class="text-sm mt-1" id="kpiRunStatus">–</div>
         <div class="text-xs muted mt-1" id="kpiUpdatedAgo">–</div>
+      </div>
+    </section>
+
+    <!-- Sezione 1b: orari di mercato e cadenza del bot (contatori al secondo) -->
+    <section aria-label="Mercato e bot" class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-3">
+          <h2 class="text-base font-semibold">Mercato USA</h2>
+          <span id="mktPill" class="pill">–</span>
+        </div>
+        <div class="text-sm t2 mt-3" id="mktCountLabel">–</div>
+        <div class="text-3xl sm:text-4xl font-semibold num mt-1" id="mktCount" aria-live="off">–</div>
+        <div class="bar mt-3" aria-hidden="true"><span id="mktBar" style="width:0%"></span></div>
+        <dl class="kv mt-4 text-sm" id="mktInfo"></dl>
+        <p class="text-xs muted mt-3" id="mktSource">–</p>
+      </div>
+      <div class="card p-5">
+        <div class="flex items-center justify-between gap-3">
+          <h2 class="text-base font-semibold">Bot</h2>
+          <span id="botPill" class="pill">–</span>
+        </div>
+        <div class="text-sm t2 mt-3" id="botCountLabel">–</div>
+        <div class="text-3xl sm:text-4xl font-semibold num mt-1" id="botCount" aria-live="off">–</div>
+        <div class="bar mt-3" aria-hidden="true"><span id="botBar" style="width:0%"></span></div>
+        <dl class="kv mt-4 text-sm" id="botInfo"></dl>
+        <p class="text-xs muted mt-3" id="botSource">–</p>
       </div>
     </section>
 
@@ -195,12 +229,17 @@
           <thead>
             <tr>
               <th>Apertura</th><th>Ticker</th><th>Strategia</th><th>Stato</th>
-              <th class="r">Qty</th><th class="r">DTE</th><th class="r">Entrata</th><th class="r">P&amp;L</th><th>Motivo chiusura</th>
+              <th class="r">Qty</th><th class="r">DTE</th><th class="r">Costo</th><th class="r">Rischio max</th><th class="r">P&amp;L</th><th>Motivo chiusura</th>
             </tr>
           </thead>
           <tbody id="tradesTable"></tbody>
         </table>
       </div>
+      <p class="text-xs muted px-5 py-3" style="border-top: 1px solid var(--border);">
+        <strong class="t2">Costo</strong>: soldi pagati (debito) o incassati (credito) all'apertura = prezzo netto × 100 × contratti; per i trade chiusi c'è anche il costo della chiusura.
+        <strong class="t2">Rischio max</strong>: quanto puoi perdere al massimo con quel trade (per i crediti è il capitale bloccato come margine).
+        Eventuali commissioni o fee non sono incluse.
+      </p>
     </section>
 
     <!-- Sezione 4: screening -->
@@ -239,6 +278,11 @@
     const SUPABASE_ANON_KEY = "sb_publishable_vfCYd9Uc7GIs7IeW2I86Lg_SxeSNoc4";
 
     const REFRESH_MS = 30_000;  // polling di riserva; con Realtime attivo i dati arrivano subito
+
+    // Cadenza dello scheduler: deve corrispondere a supabase/scheduler.sql (cron '*/5 13-20 * * 1-5', idle 12 min)
+    const SCHED = { everyMin: 5, fromHourUtc: 13, toHourUtc: 20, idleMin: 12 };
+    // Valori di default del bot, usati solo finché la tabella bot_status non riporta quelli reali
+    const BOT_DEFAULTS = { refreshSec: 60, tradeMin: 10, sessionMaxMin: 340 };
 
     // ------------------------------------------------------------------ //
     // Formattazione
@@ -315,9 +359,10 @@
         .order("timestamp", { ascending: false }).limit(1);
       if (error) throw error;
       if (!last.length) return [];
-      const ref = last[0];
-      const query = db.from("screening_logs").select("*").order("opportunity_score", { ascending: false });
-      const { data, error: e2 } = ref.run_id ? await query.eq("run_id", ref.run_id) : await query.eq("timestamp", ref.timestamp);
+      // Tutte le righe di un ciclo hanno lo stesso timestamp. Non filtro per run_id: in modalità sessione
+      // il run_id resta uguale per tutta la giornata e mostrerebbe tutti i cicli insieme.
+      const { data, error: e2 } = await db.from("screening_logs").select("*")
+        .eq("timestamp", last[0].timestamp).order("opportunity_score", { ascending: false });
       if (e2) throw e2;
       return data;
     }
@@ -329,19 +374,29 @@
       return data[0] ? { ...data[0], t: new Date(data[0].timestamp) } : null;
     }
 
+    // Stato attuale del bot (tabella bot_status, una riga). Se la tabella non esiste ancora, ritorna null.
+    async function fetchBotStatus() {
+      const { data, error } = await db.from("bot_status").select("*").eq("id", 1).maybeSingle();
+      state.botStatusMissing = !!error;
+      if (error) { console.warn("bot_status non disponibile:", error.message); return null; }
+      return data;
+    }
+
     async function loadAll() {
       try {
-        const [snapshots, tradesRes, screening, lastRun] = await Promise.all([
+        const [snapshots, tradesRes, screening, lastRun, botStatus] = await Promise.all([
           fetchAllSnapshots(),
           db.from("trades").select("*").order("created_at", { ascending: false }).limit(500),
           fetchLatestScreening(),
           fetchLastRun(),
+          fetchBotStatus(),
         ]);
         if (tradesRes.error) throw tradesRes.error;
         state.snapshots = snapshots.map((r) => ({ ...r, t: new Date(r.timestamp) }));
         state.trades = tradesRes.data;
         state.screening = screening;
         state.lastRun = lastRun;
+        state.botStatus = botStatus;
         $("errorBanner").classList.add("hidden");
         renderAll();
       } catch (err) {
@@ -513,6 +568,30 @@
     // ------------------------------------------------------------------ //
     const prettyStrategy = (s) => String(s || "").replaceAll("_", " ").toLowerCase().replace(/^\w|\s\w/g, (c) => c.toUpperCase());
 
+    // Prezzo netto per unità (convenzione: > 0 pagato, < 0 incassato) -> dollari effettivi dell'ordine
+    const cashAmount = (price, qty) => Math.abs(price) * 100 * Number(qty || 1);
+    function cashFlowText(price, qty) {
+      return price < 0 ? `${usd.format(cashAmount(price, qty))} incassati` : `${usd.format(cashAmount(price, qty))} pagati`;
+    }
+    function cashFlowHtml(price, qty) {
+      const amount = usd.format(cashAmount(price, qty));
+      const main = price < 0
+        ? `<span class="good">+${amount}</span> <span class="muted text-xs">incassati</span>`
+        : `<span>−${amount}</span> <span class="muted text-xs">pagati</span>`;
+      return `<div>${main}</div><div class="muted text-xs">${price < 0 ? "credito" : "debito"} ${num2.format(Math.abs(price))} × 100 × ${esc(qty ?? 1)}</div>`;
+    }
+    // Perdita massima del trade in $ calcolata sul prezzo REALE di esecuzione:
+    //   debito -> il debito pagato; credito su spread -> (larghezza - credito) x 100 x qty
+    function tradeMaxRisk(t) {
+      const entry = Number(t.entry_price), qty = Number(t.qty || 1);
+      const width = Number(t.legs_json?.width || 0);
+      if (!Number.isFinite(entry)) return null;
+      if (entry >= 0) return cashAmount(entry, qty);
+      if (width > 0) return Math.max(0, width - Math.abs(entry)) * 100 * qty;
+      const perContract = Number(t.legs_json?.max_loss_per_contract);
+      return Number.isFinite(perContract) && perContract > 0 ? perContract * qty : null;
+    }
+
     function renderTrades() {
       const all = state.trades;
       const open = all.filter((t) => t.status === "OPEN");
@@ -521,20 +600,29 @@
       const unreal = open.reduce((a, t) => a + Number(t.unrealized_pnl || 0), 0);
       const wins = closed.filter((t) => Number(t.pnl) > 0).length;
       const scored = closed.filter((t) => t.pnl !== null).length;
+      const openRisk = open.reduce((a, t) => a + (tradeMaxRisk(t) || 0), 0);
       $("tradesSummary").innerHTML =
         `${open.length} aperti · ${closed.length} chiusi · P&L realizzato <span class="num ${cls(realized)}">${fmtUsd(realized)}</span>` +
         ` · non realizzato <span class="num ${cls(unreal)}">${fmtUsd(unreal)}</span>` +
+        (open.length ? ` · rischio max posizioni aperte <span class="num">${usd.format(openRisk)}</span>` : "") +
         (scored ? ` · win rate ${Math.round((wins / scored) * 100)}%` : "");
 
       const rows = state.status === "ALL" ? all : all.filter((t) => t.status === state.status);
       if (!rows.length) {
-        $("tradesTable").innerHTML = `<tr><td colspan="9" class="muted text-center py-6">Nessun trade da mostrare.</td></tr>`;
+        $("tradesTable").innerHTML = `<tr><td colspan="10" class="muted text-center py-6">Nessun trade da mostrare.</td></tr>`;
         return;
       }
+      const equityNow = Number(state.snapshots.at(-1)?.equity || 0);
       $("tradesTable").innerHTML = rows.map((t) => {
         const entry = Number(t.entry_price);
-        const entryTxt = `${num2.format(Math.abs(entry))} <span class="muted">${entry < 0 ? "CR" : "DB"}</span>`;
         const isOpen = t.status === "OPEN";
+        const costTxt = cashFlowHtml(entry, t.qty) +
+          (!isOpen && t.exit_price !== null && t.exit_price !== undefined
+            ? `<div class="muted text-xs">chiusura: ${cashFlowText(Number(t.exit_price), t.qty)}</div>` : "");
+        const risk = tradeMaxRisk(t);
+        const riskTxt = risk === null ? `<span class="muted">–</span>`
+          : `<div>${usd.format(risk)}</div>` +
+            (equityNow > 0 ? `<div class="muted text-xs">${num2.format((risk / equityNow) * 100)}% del capitale</div>` : "");
         const pnl = isOpen ? t.unrealized_pnl : t.pnl;
         // % sul credito incassato / debito pagato: è il numero che il bot confronta con le soglie TP/SL
         const basis = Math.abs(entry) * 100 * Number(t.qty || 1);
@@ -551,7 +639,8 @@
           <td><span class="pill ${isOpen ? "open" : ""}"><span class="dot"></span>${isOpen ? "OPEN" : "CLOSED"}</span></td>
           <td class="r num">${esc(t.qty ?? "–")}</td>
           <td class="r num">${esc(t.dte ?? "–")}</td>
-          <td class="r num">${entryTxt}</td>
+          <td class="r num">${costTxt}</td>
+          <td class="r num">${riskTxt}</td>
           <td class="r num">${pnlTxt}</td>
           <td class="t2">${esc(prettyStrategy(t.close_reason) || "–")}</td>
         </tr>`;
@@ -590,7 +679,271 @@
       }).join("");
     }
 
-    function renderAll() { renderKpis(); renderChart(); renderTrades(); renderScreening(); }
+    // ------------------------------------------------------------------ //
+    // Orari del mercato USA (calendario NYSE) e cadenza del bot
+    // ------------------------------------------------------------------ //
+    const NY_TZ = "America/New_York";
+    const nyPartsFmt = new Intl.DateTimeFormat("en-US", { timeZone: NY_TZ, year: "numeric", month: "2-digit", day: "2-digit",
+                                                         hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+    const nyTimeFmt = new Intl.DateTimeFormat("it-IT", { timeZone: NY_TZ, hour: "2-digit", minute: "2-digit" });
+    const dayFmt = new Intl.DateTimeFormat("it-IT", { weekday: "short", day: "numeric", month: "short" });
+    const dayTimeFmt = new Intl.DateTimeFormat("it-IT", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+
+    function nyParts(date) {
+      const p = {};
+      for (const { type, value } of nyPartsFmt.formatToParts(date)) p[type] = Number(value);
+      return { y: p.year, m: p.month, d: p.day, hh: p.hour % 24, mm: p.minute };
+    }
+    // Ora "da parete" di New York -> istante assoluto (l'ora legale USA è gestita dal browser)
+    function nyTime(y, m, d, hh, mm) {
+      const target = Date.UTC(y, m - 1, d, hh, mm);
+      let t = target + 5 * 3_600_000;
+      for (let i = 0; i < 3; i++) {
+        const p = nyParts(new Date(t));
+        const diff = target - Date.UTC(p.y, p.m - 1, p.d, p.hh, p.mm);
+        if (!diff) break;
+        t += diff;
+      }
+      return new Date(t);
+    }
+    // Date di calendario pure (senza fuso), calcolate in UTC
+    const dkey = (y, m, d) => `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    const weekday = (y, m, d) => new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+    const addDays = (y, m, d, n) => { const t = new Date(Date.UTC(y, m - 1, d + n)); return { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate() }; };
+    function nthWeekday(y, m, wd, n) {  // n-esimo giorno `wd` del mese (n = -1: l'ultimo)
+      if (n > 0) return 1 + ((wd - weekday(y, m, 1) + 7) % 7) + (n - 1) * 7;
+      const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+      return last - ((weekday(y, m, last) - wd + 7) % 7);
+    }
+    function easter(y) {  // computus gregoriano
+      const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4;
+      const f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+      const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7, mm = Math.floor((a + 11 * h + 22 * l) / 451);
+      return { m: Math.floor((h + l - 7 * mm + 114) / 31), d: ((h + l - 7 * mm + 114) % 31) + 1 };
+    }
+    // Festività NYSE e chiusure anticipate (13:00 New York), calcolate con le regole ufficiali
+    const calCache = new Map();
+    function nyseCalendar(y) {
+      if (calCache.has(y)) return calCache.get(y);
+      const holidays = new Map(), early = new Map();
+      const add = (m, d, name) => holidays.set(dkey(y, m, d), name);
+      const observed = (m, d, name, satToFriday = true) => {  // sabato -> venerdì prima, domenica -> lunedì dopo
+        const wd = weekday(y, m, d);
+        const shift = wd === 6 ? (satToFriday ? -1 : null) : wd === 0 ? 1 : 0;
+        if (shift === null) return;
+        const o = addDays(y, m, d, shift);
+        holidays.set(dkey(o.y, o.m, o.d), name);
+      };
+      observed(1, 1, "Capodanno", false);  // se cade di sabato la NYSE non lo recupera
+      add(1, nthWeekday(y, 1, 1, 3), "Martin Luther King Day");
+      add(2, nthWeekday(y, 2, 1, 3), "Presidents' Day");
+      const ea = easter(y), gf = addDays(y, ea.m, ea.d, -2);
+      add(gf.m, gf.d, "Venerdì Santo");
+      add(5, nthWeekday(y, 5, 1, -1), "Memorial Day");
+      observed(6, 19, "Juneteenth");
+      observed(7, 4, "Independence Day");
+      add(9, nthWeekday(y, 9, 1, 1), "Labor Day");
+      const tg = nthWeekday(y, 11, 4, 4);
+      add(11, tg, "Thanksgiving");
+      observed(12, 25, "Natale");
+      const wdJul3 = weekday(y, 7, 3), wdDec24 = weekday(y, 12, 24);
+      if (wdJul3 >= 1 && wdJul3 <= 4) early.set(dkey(y, 7, 3), "vigilia dell'Independence Day");
+      early.set(dkey(y, 11, tg + 1), "giorno dopo Thanksgiving");
+      if (wdDec24 >= 1 && wdDec24 <= 4) early.set(dkey(y, 12, 24), "vigilia di Natale");
+      const cal = { holidays, early };
+      calCache.set(y, cal);
+      return cal;
+    }
+    function sessionOn(y, m, d) {
+      const wd = weekday(y, m, d), key = dkey(y, m, d), cal = nyseCalendar(y);
+      if (wd === 0 || wd === 6) return { closed: true, reason: "weekend" };
+      if (cal.holidays.has(key)) return { closed: true, reason: cal.holidays.get(key) };
+      const early = cal.early.get(key) || null;
+      return { closed: false, early, open: nyTime(y, m, d, 9, 30), close: nyTime(y, m, d, early ? 13 : 16, 0) };
+    }
+    function calendarState(now) {
+      const p = nyParts(now), today = sessionOn(p.y, p.m, p.d);
+      if (!today.closed && now >= today.open && now < today.close) return { isOpen: true, open: today.open, close: today.close, today };
+      for (let i = !today.closed && now < today.open ? 0 : 1; i < 15; i++) {
+        const day = addDays(p.y, p.m, p.d, i), s = sessionOn(day.y, day.m, day.d);
+        if (!s.closed) return { isOpen: false, nextOpen: s.open, nextClose: s.close, today };
+      }
+      return { isOpen: false, today };
+    }
+    // Se il bot ha pubblicato il clock di Alpaca (fonte ufficiale) ed è ancora valido, ha la precedenza
+    function marketState(now) {
+      const cal = { ...calendarState(now), source: "calendar" };
+      const b = state.botStatus;
+      if (!b?.market_next_open || !b?.market_next_close) return cal;
+      const o = new Date(b.market_next_open), c = new Date(b.market_next_close);
+      if (!(now < c)) return cal;
+      if (c < o) return { ...cal, isOpen: true, open: cal.open || cal.today.open, close: c, source: "alpaca" };
+      if (now < o) return { ...cal, isOpen: false, nextOpen: o, nextClose: c, source: "alpaca" };
+      return { ...cal, isOpen: true, open: o, close: c, source: "alpaca" };
+    }
+    function upcomingClosures(now, days = 30, max = 2) {
+      const p = nyParts(now), out = [];
+      for (let i = 0; i <= days && out.length < max; i++) {
+        const day = addDays(p.y, p.m, p.d, i), wd = weekday(day.y, day.m, day.d);
+        if (wd === 0 || wd === 6) continue;
+        const cal = nyseCalendar(day.y), key = dkey(day.y, day.m, day.d);
+        const date = new Date(Date.UTC(day.y, day.m - 1, day.d, 12));
+        if (cal.holidays.has(key)) out.push(`${dayFmt.format(date)}: chiuso (${esc(cal.holidays.get(key))})`);
+        else if (cal.early.has(key)) out.push(`${dayFmt.format(date)}: chiude alle ${tFmt.format(nyTime(day.y, day.m, day.d, 13, 0))} (${esc(cal.early.get(key))})`);
+      }
+      return out;
+    }
+    // Prossimo controllo dello scheduler Supabase (cron in UTC) a partire da `from`
+    function nextSchedulerTick(from) {
+      const step = SCHED.everyMin * 60_000;
+      let t = new Date(Math.ceil(from.getTime() / step) * step);
+      for (let i = 0; i < 20; i++) {
+        const wd = t.getUTCDay(), h = t.getUTCHours();
+        const weekdayOk = wd >= 1 && wd <= 5;
+        if (weekdayOk && h >= SCHED.fromHourUtc && h <= SCHED.toHourUtc) return t;
+        const sameDay = weekdayOk && h < SCHED.fromHourUtc;
+        t = new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate() + (sameDay ? 0 : 1), SCHED.fromHourUtc));
+      }
+      return null;
+    }
+    const utcToday = (h, m) => { const n = new Date(); return new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate(), h, m)); };
+
+    const pctWidth = (part, whole) => `${whole > 0 ? Math.min(100, Math.max(0, (part / whole) * 100)) : 0}%`;
+    function fmtCountdown(ms) {
+      const s = Math.max(0, Math.floor(ms / 1000));
+      const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+      const hms = [h, m, sec].map((v) => String(v).padStart(2, "0")).join(":");
+      return d ? `${d}g ${hms}` : hms;
+    }
+    function fmtDur(ms) {
+      const min = Math.max(0, Math.round(ms / 60_000));
+      if (min < 1) return "meno di 1 min";
+      const h = Math.floor(min / 60), m = min % 60;
+      return h ? `${h} h ${String(m).padStart(2, "0")} min` : `${m} min`;
+    }
+    function setPill(id, kind, text) {
+      const el = $(id);
+      el.className = `pill ${kind}`;
+      el.innerHTML = `<span class="dot"></span>${esc(text)}`;
+    }
+    const kvHtml = (rows) => rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+
+    function renderMarket(now) {
+      const ms = marketState(now), t = ms.today;
+      if (ms.isOpen) {
+        setPill("mktPill", "good", t.early ? "Aperto · chiusura anticipata" : "Aperto");
+        $("mktCountLabel").textContent = `Chiude tra (alle ${tFmt.format(ms.close)})`;
+        $("mktCount").textContent = fmtCountdown(ms.close - now);
+        const start = ms.open || t.open;
+        $("mktBar").style.width = start ? pctWidth(now - start, ms.close - start) : "0%";
+      } else {
+        setPill("mktPill", "", "Chiuso");
+        $("mktCountLabel").textContent = ms.nextOpen ? `Apre tra (${dayTimeFmt.format(ms.nextOpen)})` : "Prossima apertura non disponibile";
+        $("mktCount").textContent = ms.nextOpen ? fmtCountdown(ms.nextOpen - now) : "–";
+        $("mktBar").style.width = "0%";
+      }
+      const rows = [[
+        "Oggi",
+        t.closed
+          ? (t.reason === "weekend" ? "chiuso (weekend)" : `chiuso: ${esc(t.reason)}`)
+          : `${tFmt.format(t.open)} – ${tFmt.format(t.close)} <span class="muted">(${nyTimeFmt.format(t.open)} – ${nyTimeFmt.format(t.close)} New York)</span>` +
+            (t.early ? `<br><span style="color:var(--warn)">chiusura anticipata: ${esc(t.early)}</span>` : ""),
+      ]];
+      if (!ms.isOpen && ms.nextOpen) rows.push(["Prossima sessione", `${dayFmt.format(ms.nextOpen)}, ${tFmt.format(ms.nextOpen)} – ${tFmt.format(ms.nextClose)}`]);
+      const closures = upcomingClosures(now);
+      if (closures.length) rows.push(["Festività", closures.join("<br>")]);
+      $("mktInfo").innerHTML = kvHtml(rows);
+      $("mktSource").textContent = (ms.source === "alpaca"
+        ? `Orari ufficiali dal clock di Alpaca (letto dal bot ${timeAgo(new Date(state.botStatus.clock_at || state.botStatus.updated_at))}).`
+        : "Orari dal calendario NYSE (festività e chiusure anticipate incluse).") + " Ore nel fuso del tuo browser.";
+    }
+
+    const TRIGGER_LABEL = { "supabase-scheduler": "scheduler Supabase", "github-cron": "cron GitHub", manual: "avvio manuale", local: "locale" };
+
+    function renderBot(now) {
+      const b = state.botStatus;
+      if (!configured) { setPill("botPill", "", "Non configurato"); return; }
+      const refreshSec = b?.refresh_interval_sec || BOT_DEFAULTS.refreshSec;
+      const tradeMin = b?.trade_interval_min || BOT_DEFAULTS.tradeMin;
+      const maxMin = b?.session_max_minutes || BOT_DEFAULTS.sessionMaxMin;
+      const updated = b ? new Date(b.updated_at) : null;
+      const lastSnap = state.snapshots.at(-1)?.t || null;
+      const lastSignal = new Date(Math.max(updated?.getTime() || 0, lastSnap?.getTime() || 0, state.lastRun?.t?.getTime() || 0));
+      const staleMs = Math.max(3 * refreshSec * 1000, 5 * 60_000);
+      const alive = now - lastSignal < staleMs;
+      const active = b ? alive && ["RUNNING", "WAITING_OPEN"].includes(b.state) : !!lastSnap && now - lastSnap < staleMs;
+      const ms = marketState(now);
+      const rows = [];
+      let label = "", count = "–", bar = "0%";
+
+      if (active && b?.state === "WAITING_OPEN") {
+        setPill("botPill", "warn", "In attesa dell'apertura");
+        label = "Il bot è partito e attende l'apertura del mercato tra";
+        count = ms.nextOpen ? fmtCountdown(ms.nextOpen - now) : "–";
+      } else if (active) {
+        setPill("botPill", "good", "In sessione");
+        let next = b?.next_trade_cycle_at ? new Date(b.next_trade_cycle_at) : null;
+        if (!next && state.screening[0]) next = new Date(new Date(state.screening[0].timestamp).getTime() + tradeMin * 60_000);
+        if (next) {
+          const left = next - now, period = tradeMin * 60_000;
+          label = `Prossimo ciclo di trading (alle ${tFmt.format(next)}) tra`;
+          count = left > 0 ? fmtCountdown(left) : "in corso…";
+          bar = pctWidth(period - left, period);
+        } else {
+          label = "Primo ciclo di trading in corso";
+        }
+        const deadline = b?.session_deadline ? new Date(b.session_deadline) : null;
+        const close = ms.isOpen ? ms.close : null;
+        const end = deadline && close ? (deadline < close ? deadline : close) : deadline || close;
+        if (end) {
+          const byDeadline = deadline && end === deadline && (!close || deadline < close);
+          rows.push(["Fine sessione", `tra ${fmtDur(end - now)} (alle ${tFmt.format(end)}) · ` +
+            (byDeadline ? `limite di ${maxMin} min del job, poi lo scheduler la riavvia entro ~${SCHED.idleMin + SCHED.everyMin} min` : "chiusura del mercato")]);
+        }
+        if (b?.session_started_at) {
+          rows.push(["Sessione iniziata", `${tFmt.format(new Date(b.session_started_at))} · ${b.trading_cycles ?? 0} cicli di trading finora`]);
+        }
+      } else {
+        const crashed = b?.state === "RUNNING" && ms.isOpen;
+        setPill("botPill", crashed ? "bad" : "", crashed ? "Nessun segnale" : "Fermo");
+        if (ms.isOpen) {
+          // Lo scheduler riavvia il bot al primo controllo dopo `idleMin` minuti senza segnali
+          const earliest = new Date(Math.max(now.getTime(), lastSignal.getTime() + SCHED.idleMin * 60_000));
+          const restart = nextSchedulerTick(earliest);
+          label = restart ? `Mercato aperto: lo scheduler lo riavvia alle ${tFmt.format(restart)}, tra` : "Mercato aperto, scheduler fuori orario";
+          count = restart ? fmtCountdown(restart - now) : "–";
+        } else {
+          label = ms.nextOpen ? "Mercato chiuso: la prossima sessione parte all'apertura, tra" : "Mercato chiuso";
+          count = ms.nextOpen ? fmtCountdown(ms.nextOpen - now) : "–";
+        }
+        if (b?.message) rows.push(["Ultimo stop", `${updated ? tFmt.format(updated) + " · " : ""}${esc(b.message)}`]);
+      }
+
+      const tick = nextSchedulerTick(now);
+      rows.push(["Scheduler", `ogni ${SCHED.everyMin} min, lun–ven ${tFmt.format(utcToday(SCHED.fromHourUtc, 0))}–${tFmt.format(utcToday(SCHED.toHourUtc, 55))}: ` +
+        `avvia il bot se è fermo da più di ${SCHED.idleMin} min` +
+        (tick ? `<br><span class="muted">prossimo controllo ${tick - now < 86_400_000 ? `tra ${fmtCountdown(tick - now)}` : dayTimeFmt.format(tick)}</span>` : "")]);
+      rows.push(["Durante la sessione", `posizioni e TP/SL ogni ${refreshSec} s · screening e nuovi trade ogni ${tradeMin} min · durata max ${maxMin} min` +
+        (b ? "" : ` <span class="muted">(valori di default)</span>`)]);
+
+      $("botCountLabel").textContent = label;
+      $("botCount").textContent = count;
+      $("botBar").style.width = bar;
+      $("botInfo").innerHTML = kvHtml(rows);
+      $("botSource").textContent = b
+        ? `Stato pubblicato dal bot ${timeAgo(updated)}${b.run_id ? ` · run ${b.run_id}` : ""}${b.trigger ? ` · avviato da ${TRIGGER_LABEL[b.trigger] || b.trigger}` : ""}${b.dry_run ? " · DRY_RUN" : ""}.`
+        : state.botStatusMissing
+          ? "Tabella bot_status non trovata: riesegui supabase/schema.sql per avere i contatori esatti (ora sono stime)."
+          : "Il bot non ha ancora pubblicato il suo stato: i contatori diventano esatti dal prossimo run.";
+    }
+
+    function renderClocks() {
+      const now = new Date();
+      try { renderMarket(now); } catch (err) { console.error("renderMarket", err); }
+      try { renderBot(now); } catch (err) { console.error("renderBot", err); }
+    }
+
+    function renderAll() { renderKpis(); renderClocks(); renderChart(); renderTrades(); renderScreening(); }
 
     // ------------------------------------------------------------------ //
     // Controlli
@@ -630,6 +983,9 @@
       $("liveLabel").textContent = label;
     }
 
+    renderClocks();
+    setInterval(renderClocks, 1000);  // contatori al secondo (nessuna chiamata al database)
+
     if (!configured) {
       $("configMsg").innerHTML = problem;
       $("configBanner").classList.remove("hidden");
@@ -648,6 +1004,9 @@
         .on("postgres_changes", { event: "*", schema: "public", table: "trades" }, scheduleReload)
         .on("postgres_changes", { event: "INSERT", schema: "public", table: "screening_logs" }, scheduleReload)
         .on("postgres_changes", { event: "INSERT", schema: "public", table: "bot_runs" }, scheduleReload)
+        .on("postgres_changes", { event: "*", schema: "public", table: "bot_status" }, (payload) => {
+          if (payload.new && payload.new.id === 1) { state.botStatus = payload.new; renderClocks(); }
+        })
         .subscribe((status) => {
           if (status === "SUBSCRIBED") setLive(true, "Live");
           else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") setLive(false, `Aggiornamento ogni ${REFRESH_MS / 1000}s`);

@@ -225,12 +225,13 @@ Il cron di GitHub ritarda o salta spesso i run: è capitato che in un'intera gio
 4. Scegli una scadenza (per esempio 1 anno), genera il token e copialo.
 
 **2. Installa lo scheduler**
-1. Supabase → **SQL Editor → New query**: incolla tutto [`supabase/scheduler.sql`](supabase/scheduler.sql) e premi **Run**.
-2. In una **nuova** query, *non* in un file del repository, salva il token nel Vault cifrato:
+1. Supabase → **Database → Extensions**: cerca **pg_cron** e attivalo, poi fai lo stesso con **pg_net**. Attivali da qui e non da SQL: creare pg_cron via SQL può fallire con "dependent privileges exist".
+2. Supabase → **SQL Editor → New query**: incolla tutto [`supabase/scheduler.sql`](supabase/scheduler.sql) e premi **Run**.
+3. In una **nuova** query, *non* in un file del repository, salva il token nel Vault cifrato:
    ```sql
    select vault.create_secret('IL_TUO_TOKEN', 'github_dispatch_token');
    ```
-3. Prova subito: `select private.dispatch_bot_if_idle();`. Se il bot è fermo risponde "avvio richiesto" e su GitHub → Actions compare un run.
+4. Prova subito: `select private.dispatch_bot_if_idle();`. Se il bot è fermo risponde "avvio richiesto" e su GitHub → Actions compare un run.
 
 **Verifiche utili** (in fondo a `scheduler.sql` ci sono le query pronte):
 - `select * from cron.job_run_details order by start_time desc limit 10;` mostra cosa ha deciso lo scheduler a ogni controllo;
@@ -260,10 +261,14 @@ Il cron di GitHub ritarda o salta spesso i run: è capitato che in un'intera gio
 La dashboard mostra:
 - le KPI: capitale iniziale e attuale, rendimento totale in `$` e `%`, P&L giornaliero, ultimo aggiornamento;
 - il grafico dell'equity, con toggle `$`/`%`, filtro temporale e tabella dei dati;
-- le posizioni aperte (con P&L non realizzato) e lo storico dei trade;
+- il **mercato USA**: aperto o chiuso, con un contatore al secondo fino alla chiusura o alla prossima apertura, gli orari di oggi (ora locale e di New York) e le prossime festività e chiusure anticipate. Gli orari vengono dal clock ufficiale di Alpaca pubblicato dal bot; quando non c'è, dal calendario NYSE calcolato nella pagina;
+- il **bot**: in sessione, in attesa o fermo, con il contatore al prossimo ciclo di trading, l'ora di fine della sessione e il tempo rimanente, la cadenza dello scheduler (ogni 5 minuti) e gli intervalli della sessione (`REFRESH_INTERVAL_SEC`, `TRADE_INTERVAL_MIN`, `SESSION_MAX_MINUTES`);
+- le posizioni aperte (con P&L non realizzato) e lo storico dei trade. Per ogni trade ci sono il **costo** (premio pagato o incassato = prezzo netto × 100 × contratti, più il costo di chiusura per i trade chiusi) e il **rischio massimo** in $ e in % del capitale. Le eventuali commissioni non sono incluse;
 - l'ultimo screening, con il motivo per cui ogni ticker è stato scelto o scartato.
 
-Si aggiorna in tempo reale tramite Supabase Realtime, con un fallback di polling ogni 60 secondi.
+Si aggiorna in tempo reale tramite Supabase Realtime, con un fallback di polling ogni 30 secondi.
+
+> **Contatori del bot:** usano la tabella `bot_status`, che il bot aggiorna a ogni ciclo. Se hai creato il database prima di questa funzione, **riesegui `supabase/schema.sql`**: è idempotente e aggiunge solo la tabella mancante. Finché non lo fai, la dashboard mostra delle stime e il bot lo segnala una sola volta nel log, senza fermarsi.
 
 ---
 

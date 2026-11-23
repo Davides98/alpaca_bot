@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from alpaca.common.exceptions import APIError
@@ -121,6 +121,8 @@ class RunContext:
     storage: SupabaseStorage
     status: str = "STARTED"  # OK | MARKET_CLOSED | CONFIG_ERROR | AUTH_ERROR | ERROR
     message: str = ""
+    bot_status: BotStatus | None = None
+    last_clock: Any = None  # ultimo clock Alpaca letto (per gli orari di mercato in dashboard)
 
     def finish(self, status: str, message: str) -> None:
         self.status, self.message = status, message
@@ -177,6 +179,58 @@ class SessionStats:
     orders_filled: int = 0
     positions_closed: int = 0
     errors: int = 0
+
+
+def _iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+@dataclass
+class BotStatus:
+    """Stato attuale del bot (tabella bot_status, una riga): alimenta i contatori della dashboard."""
+
+    storage: SupabaseStorage
+    settings: Settings
+    run_id: str
+    session_started_at: datetime | None = None
+    session_deadline: datetime | None = None
+    last_trade_cycle_at: datetime | None = None
+    next_trade_cycle_at: datetime | None = None
+    trading_cycles: int = 0
+
+    def row(self, state: str, clock: Any = None, message: str = "") -> dict[str, Any]:
+        s = self.settings
+        row: dict[str, Any] = {
+            "state": state,
+            "message": message[:300],
+            "run_id": self.run_id,
+            "trigger": os.getenv("BOT_TRIGGER") or os.getenv("GITHUB_EVENT_NAME", "local"),
+            "dry_run": s.DRY_RUN,
+            "session_mode": s.SESSION_MODE,
+            "refresh_interval_sec": s.REFRESH_INTERVAL_SEC,
+            "trade_interval_min": s.TRADE_INTERVAL_MIN,
+            "session_max_minutes": s.SESSION_MAX_MINUTES,
+            "session_started_at": _iso(self.session_started_at),
+            "session_deadline": _iso(self.session_deadline),
+            "last_trade_cycle_at": _iso(self.last_trade_cycle_at),
+            "next_trade_cycle_at": _iso(self.next_trade_cycle_at),
+            "trading_cycles": self.trading_cycles,
+        }
+        if clock is not None:  # orari ufficiali di Alpaca (festività e chiusure anticipate incluse)
+            row.update(
+                market_is_open=bool(clock.is_open),
+                market_next_open=_iso(clock.next_open),
+                market_next_close=_iso(clock.next_close),
+                clock_at=_iso(clock.timestamp),
+            )
+        return row
+
+    def publish(self, state: str, clock: Any = None, message: str = "") -> None:
+        self.storage.update_bot_status(self.row(state, clock, message))
 
 
 def account_snapshot(svc: Services, verbose: bool = False) -> float:
@@ -277,16 +331,23 @@ def trading_cycle(settings: Settings, svc: Services, run_id: str, equity: float,
     )
 
 
-def wait_for_open(settings: Settings, trading: TradingClient) -> bool:
+def wait_for_open(settings: Settings, trading: TradingClient, ctx: RunContext | None = None) -> bool:
     """Modalità sessione: se l'apertura è vicina (<= SESSION_WAIT_FOR_OPEN_MIN) la aspetta. True se aperto."""
     clock = trading.get_clock()
+    if ctx is not None:
+        ctx.last_clock = clock
     if clock.is_open:
         return True
     wait_s = (clock.next_open - clock.timestamp).total_seconds()
     if 0 < wait_s <= settings.SESSION_WAIT_FOR_OPEN_MIN * 60:
         logger.info("Mercato chiuso, apre tra {:.0f} minuti: attendo l'apertura", wait_s / 60)
+        if ctx is not None and ctx.bot_status is not None:
+            ctx.bot_status.publish("WAITING_OPEN", clock, f"In attesa dell'apertura ({wait_s / 60:.0f} min)")
         time.sleep(wait_s + 15)
-        return trading.get_clock().is_open
+        clock = trading.get_clock()
+        if ctx is not None:
+            ctx.last_clock = clock
+        return bool(clock.is_open)
     return False
 
 
@@ -299,6 +360,10 @@ def run_session(settings: Settings, ctx: RunContext, svc: Services) -> str:
     """
     stats = SessionStats()
     deadline = time.monotonic() + settings.SESSION_MAX_MINUTES * 60
+    status = ctx.bot_status or BotStatus(ctx.storage, settings, ctx.run_id)
+    started = datetime.now(timezone.utc)
+    status.session_started_at = started
+    status.session_deadline = started + timedelta(minutes=settings.SESSION_MAX_MINUTES)
     next_trading = 0.0
     consecutive_errors = 0
     end_reason = ""
@@ -313,7 +378,9 @@ def run_session(settings: Settings, ctx: RunContext, svc: Services) -> str:
             end_reason = "durata massima raggiunta, il prossimo run schedulato riprende"
             break
         try:
-            is_open = svc.trading.get_clock().is_open
+            clock = svc.trading.get_clock()
+            ctx.last_clock = clock
+            is_open = clock.is_open
             test_mode = settings.DRY_RUN and settings.IGNORE_MARKET_HOURS and stats.trading_cycles == 0
             if not is_open and not test_mode:
                 end_reason = "mercato chiuso"
@@ -325,11 +392,16 @@ def run_session(settings: Settings, ctx: RunContext, svc: Services) -> str:
                 logger.info("Ciclo di trading #{}: {}", stats.trading_cycles, summary)
                 svc.storage.log_run(ctx.run_id, "OK", f"[ciclo {stats.trading_cycles}] {summary}", settings.DRY_RUN)
                 next_trading = tick + settings.TRADE_INTERVAL_MIN * 60
+                status.trading_cycles = stats.trading_cycles
+                status.last_trade_cycle_at = datetime.now(timezone.utc)
+                status.next_trade_cycle_at = status.last_trade_cycle_at + timedelta(
+                    seconds=max(0.0, next_trading - time.monotonic()))
                 if test_mode:
                     end_reason = "test a mercato chiuso (DRY_RUN + IGNORE_MARKET_HOURS), un solo ciclo"
                     break
             else:
                 refresh_cycle(svc, stats)
+            status.publish("RUNNING", clock, f"Sessione in corso: {stats.trading_cycles} cicli di trading")
             consecutive_errors = 0
         except APIError as exc:
             if getattr(exc, "status_code", None) in (401, 403):
@@ -379,12 +451,17 @@ def run(settings: Settings, ctx: RunContext) -> int:
     )
 
     # Mercato aperto? (in modalità sessione aspetta l'apertura se manca poco)
-    is_open = wait_for_open(settings, trading) if settings.SESSION_MODE else trading.get_clock().is_open
+    if settings.SESSION_MODE:
+        is_open = wait_for_open(settings, trading, ctx)
+    else:
+        ctx.last_clock = trading.get_clock()
+        is_open = ctx.last_clock.is_open
     if not is_open:
         if settings.DRY_RUN and settings.IGNORE_MARKET_HOURS:
             logger.warning("Mercato CHIUSO, ma DRY_RUN + IGNORE_MARKET_HOURS: proseguo a scopo di test (quote potenzialmente stantie)")
         else:
             clock = trading.get_clock()
+            ctx.last_clock = clock
             next_open = clock.next_open.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             logger.info("Mercato USA chiuso (prossima apertura: {}). Nessuna azione, esco.", next_open)
             ctx.finish("MARKET_CLOSED", f"Mercato chiuso, prossima apertura {next_open}. Nessuna operazione.")
@@ -439,6 +516,7 @@ def main() -> int:
         settings.STOP_LOSS_DEBIT_PCT, settings.CLOSE_DTE_THRESHOLD,
     )
     ctx = RunContext(run_id=uuid.uuid4().hex[:12], storage=SupabaseStorage(settings))
+    ctx.bot_status = BotStatus(ctx.storage, settings, ctx.run_id)
     code = 1
     try:
         code = run(settings, ctx)
@@ -458,6 +536,8 @@ def main() -> int:
         ctx.finish("ERROR", f"{type(exc).__name__}: {str(exc)[:200]}")
     finally:
         ctx.storage.log_run(ctx.run_id, ctx.status, ctx.message, settings.DRY_RUN)
+        ctx.bot_status.next_trade_cycle_at = None
+        ctx.bot_status.publish("STOPPED", ctx.last_clock, f"{ctx.status}: {ctx.message}")
         level = {"OK": "notice", "MARKET_CLOSED": "notice"}.get(ctx.status, "error")
         gh_annotation(level, f"Bot: {ctx.status}", ctx.message)
         if not ctx.storage.enabled:

@@ -81,6 +81,25 @@ class SupabaseStorage:
             logger.debug("Run {} registrato su bot_runs ({})", run_id, status)
 
     # ------------------------------------------------------------------ #
+    # bot_status: UNA sola riga (id = 1) con lo stato attuale del bot.
+    # La dashboard la usa per i contatori (prossimo ciclo, fine sessione, orari di mercato).
+    # Facoltativa: se la tabella non esiste ancora, avvisa una volta e smette di provarci
+    # (non conta come errore del run).
+    # ------------------------------------------------------------------ #
+    def update_bot_status(self, fields: dict[str, Any]) -> None:
+        if not self.enabled or getattr(self, "_status_disabled", False):
+            return
+        row = {"id": 1, "updated_at": _now_iso(), **fields}
+        try:
+            self.client.table("bot_status").upsert(row, on_conflict="id").execute()
+        except Exception as exc:  # noqa: BLE001
+            self._status_disabled = True
+            logger.warning(
+                "Supabase [bot_status] non disponibile ({}): riesegui supabase/schema.sql per attivare "
+                "i contatori della dashboard. Il bot prosegue normalmente.", str(exc)[:200],
+            )
+
+    # ------------------------------------------------------------------ #
     # equity_snapshots
     # ------------------------------------------------------------------ #
     def save_equity_snapshot(self, equity: float, cash: float, last_equity: float) -> None:

@@ -94,12 +94,44 @@ create table if not exists public.bot_runs (
 create index if not exists idx_bot_runs_ts on public.bot_runs ("timestamp" desc);
 
 -- ---------------------------------------------------------------------
+-- 5) bot_status: UNA sola riga (id = 1) con lo stato attuale del bot,
+--    aggiornata a ogni ciclo. La dashboard la usa per i contatori:
+--    prossimo ciclo di trading, fine sessione, orari ufficiali del mercato (clock Alpaca).
+-- ---------------------------------------------------------------------
+create table if not exists public.bot_status (
+    id                    smallint primary key default 1 check (id = 1),
+    updated_at            timestamptz not null default now(),
+    state                 text,          -- WAITING_OPEN | RUNNING | STOPPED
+    message               text,
+    run_id                text,
+    trigger               text,
+    dry_run               boolean,
+    session_mode          boolean,
+    refresh_interval_sec  integer,
+    trade_interval_min    integer,
+    session_max_minutes   integer,
+    session_started_at    timestamptz,
+    session_deadline      timestamptz,
+    last_trade_cycle_at   timestamptz,
+    next_trade_cycle_at   timestamptz,
+    trading_cycles        integer,
+    market_is_open        boolean,
+    market_next_open      timestamptz,
+    market_next_close     timestamptz,
+    clock_at              timestamptz
+);
+
+-- ---------------------------------------------------------------------
 -- Row Level Security
 -- ---------------------------------------------------------------------
 alter table public.equity_snapshots enable row level security;
 alter table public.trades           enable row level security;
 alter table public.screening_logs   enable row level security;
 alter table public.bot_runs         enable row level security;
+alter table public.bot_status       enable row level security;
+
+drop policy if exists "Allow public read" on public.bot_status;
+create policy "Allow public read" on public.bot_status for select to anon using (true);
 
 drop policy if exists "Allow public read" on public.bot_runs;
 create policy "Allow public read" on public.bot_runs for select to anon using (true);
@@ -116,9 +148,9 @@ create policy "Allow public read" on public.screening_logs for select to anon us
 -- Privilegi espliciti (alcuni progetti Supabase recenti non espongono
 -- automaticamente le nuove tabelle alla Data API).
 grant usage on schema public to anon, service_role;
-grant select on public.equity_snapshots, public.trades, public.screening_logs, public.bot_runs to anon;
-revoke insert, update, delete, truncate on public.equity_snapshots, public.trades, public.screening_logs, public.bot_runs from anon;
-grant all on public.equity_snapshots, public.trades, public.screening_logs, public.bot_runs to service_role;
+grant select on public.equity_snapshots, public.trades, public.screening_logs, public.bot_runs, public.bot_status to anon;
+revoke insert, update, delete, truncate on public.equity_snapshots, public.trades, public.screening_logs, public.bot_runs, public.bot_status from anon;
+grant all on public.equity_snapshots, public.trades, public.screening_logs, public.bot_runs, public.bot_status to service_role;
 grant usage, select on all sequences in schema public to service_role;
 
 -- ---------------------------------------------------------------------
@@ -130,7 +162,7 @@ declare
     t text;
 begin
     if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
-        foreach t in array array['equity_snapshots', 'trades', 'screening_logs', 'bot_runs'] loop
+        foreach t in array array['equity_snapshots', 'trades', 'screening_logs', 'bot_runs', 'bot_status'] loop
             if not exists (
                 select 1 from pg_publication_tables
                 where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = t
