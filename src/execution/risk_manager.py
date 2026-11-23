@@ -7,6 +7,13 @@ Modulo 5b - Risk Management.
     2. Stop Loss    (-100% del credito incassato / -30% del debito pagato)
     3. Protezione assegnazione: DTE <= CLOSE_DTE_THRESHOLD
 
+Protezioni sull'esecuzione delle uscite:
+- quote troppo larghe (naturale lontano dal mid) -> take profit / stop loss rimandati al ciclo dopo;
+- stop loss solo se confermato per STOP_LOSS_CONFIRM_CHECKS controlli consecutivi;
+- tetto di prezzo: mid + MAX_SLIPPAGE_PCT_OF_WIDTH; per il take profit mai oltre la soglia di profitto
+  (un take profit non può trasformarsi in una perdita);
+- dopo uno stop loss il ticker resta in pausa per STOP_LOSS_COOLDOWN_HOURS.
+
 Le posizioni Alpaca sono per singolo contratto: le raggruppiamo per (sottostante, scadenza) e le
 abbiniamo al trade OPEN salvato su Supabase (se disponibile) per recuperare strategia e prezzo di entrata.
 
@@ -19,7 +26,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import reduce
 from typing import TYPE_CHECKING, Any
 
@@ -31,12 +38,15 @@ from loguru import logger
 
 from config.settings import Settings
 
+from src.execution.executor import net_mid, net_natural, quotes_too_wide, slippage_base
+
 if TYPE_CHECKING:  # evita import circolari a runtime
     from src.data.market_data import MarketDataService
     from src.execution.executor import ExecutionResult, OrderExecutor, OrderLegSpec
     from src.storage.supabase_client import SupabaseStorage
 
 CONTRACT_MULTIPLIER = 100
+MAX_WIDE_QUOTE_POSTPONES = 15  # stop loss rimandato al massimo per 15 controlli di fila (~15 min in sessione)
 
 
 # ---------------------------------------------------------------------- #
@@ -69,6 +79,21 @@ def evaluate_exit(entry_net: float, position_value: float, dte: int, settings: S
     if dte <= settings.CLOSE_DTE_THRESHOLD:
         return "DTE_THRESHOLD", pnl
     return None, pnl
+
+
+def exit_price_cap(reason: str, entry_net: float, exit_mid: float, base: float, settings: Settings) -> float:
+    """
+    Netto massimo (con segno, + = pago) accettabile per l'ordine di chiusura.
+      - tutte le uscite: mid + MAX_SLIPPAGE_PCT_OF_WIDTH x base (base = larghezza dello spread o premio);
+      - TAKE_PROFIT: inoltre mai oltre il prezzo che realizza esattamente la soglia di profitto.
+    Realizzato per unità = -(entry_net + exit_net)  ->  exit_net <= -entry_net - target.
+    """
+    cap = exit_mid + settings.MAX_SLIPPAGE_PCT_OF_WIDTH * abs(base)
+    if reason == "TAKE_PROFIT":
+        basis = abs(entry_net)
+        pct = settings.TAKE_PROFIT_CREDIT_PCT if entry_net < 0 else settings.TAKE_PROFIT_DEBIT_PCT
+        cap = min(cap, -entry_net - pct * basis)
+    return cap
 
 
 # ---------------------------------------------------------------------- #
@@ -112,6 +137,21 @@ class PositionGroup:
         return (self.trade or {}).get("strategy") or "UNKNOWN"
 
     @property
+    def width(self) -> float:
+        """Larghezza dello spread (dal trade salvato, altrimenti dagli strike); 0 = single-leg."""
+        from src.data.market_data import parse_occ_symbol
+
+        saved = (self.trade or {}).get("legs_json", {}).get("width")
+        if saved:
+            return float(saved)
+        by_type: dict[str, list[float]] = {}
+        for leg in self.legs:
+            _, _, opt_type, strike = parse_occ_symbol(leg.symbol)
+            by_type.setdefault(str(opt_type), []).append(float(strike))
+        widths = [max(v) - min(v) for v in by_type.values() if len(v) > 1]
+        return max(widths) if widths else 0.0
+
+    @property
     def entry_net(self) -> float:
         if self.trade and self.trade.get("entry_price") is not None:
             return float(self.trade["entry_price"])
@@ -132,6 +172,7 @@ class RiskReport:
     open_groups: list[PositionGroup] = field(default_factory=list)  # ancora aperte dopo la gestione
     closed: list[str] = field(default_factory=list)
     occupied_underlyings: set[str] = field(default_factory=set)  # posizioni + ordini pendenti
+    cooldown_underlyings: set[str] = field(default_factory=set)  # in pausa dopo uno stop loss recente
 
     @property
     def open_count(self) -> int:
@@ -155,6 +196,10 @@ class RiskManager:
         self.market = market
         self.executor = executor
         self.storage = storage
+        # Controlli consecutivi in stop loss per gruppo (persistono tra i cicli della stessa sessione)
+        self._sl_streak: dict[frozenset[str], int] = {}
+        self._wide_streak: dict[frozenset[str], int] = {}  # controlli di fila rimandati per quote larghe
+        self.sl_confirm_checks = settings.STOP_LOSS_CONFIRM_CHECKS if settings.SESSION_MODE else 1
 
     # ---------------- Caricamento posizioni ---------------- #
     def load_groups(self) -> list[PositionGroup]:
@@ -262,18 +307,51 @@ class RiskManager:
             if g.trade and not self.s.DRY_RUN:
                 self.storage.update_trade(g.trade["id"], {"unrealized_pnl": round(pnl_usd, 2), "dte": g.dte})
 
+            key = frozenset(g.symbols)
+            if reason != "STOP_LOSS":
+                self._sl_streak.pop(key, None)
             if reason is None:
                 logger.info("[{}] nessuna condizione di uscita: mantengo la posizione", label)
                 report.open_groups.append(g)
                 continue
 
-            logger.warning("[{}] condizione di uscita {} -> chiudo la posizione", label, reason)
-            result = self.close_group(g, label)
+            specs = self.close_specs(g)
+            width = g.width
+            if reason in ("TAKE_PROFIT", "STOP_LOSS") and quotes_too_wide(specs, width, self.s.MAX_QUOTE_WIDTH_PCT_OF_WIDTH):
+                waited = self._wide_streak.get(key, 0) + 1
+                self._wide_streak[key] = waited
+                # Il take profit può aspettare; lo stop loss non all'infinito: dopo MAX_WIDE_QUOTE_POSTPONES
+                # controlli di fila chiude comunque (con il tetto di prezzo che limita la slippage).
+                if reason == "TAKE_PROFIT" or waited < MAX_WIDE_QUOTE_POSTPONES:
+                    logger.warning(
+                        "[{}] {} rilevato ma quote troppo larghe (mid {:+.2f}, naturale {:+.2f}): non mi fido del prezzo, "
+                        "ricontrollo al prossimo ciclo ({}/{})", label, reason, net_mid(specs), net_natural(specs),
+                        waited, MAX_WIDE_QUOTE_POSTPONES,
+                    )
+                    report.open_groups.append(g)
+                    continue
+            else:
+                self._wide_streak.pop(key, None)
+            if reason == "STOP_LOSS":
+                streak = self._sl_streak.get(key, 0) + 1
+                self._sl_streak[key] = streak
+                if streak < self.sl_confirm_checks:
+                    logger.warning("[{}] STOP_LOSS da confermare ({}/{}): ricontrollo al prossimo ciclo",
+                                   label, streak, self.sl_confirm_checks)
+                    report.open_groups.append(g)
+                    continue
+
+            cap = exit_price_cap(reason, g.entry_net, net_mid(specs), slippage_base(specs, width), self.s)
+            logger.warning("[{}] condizione di uscita {} -> chiudo la posizione (tetto prezzo {:+.2f})", label, reason, cap)
+            result = self.close_group(g, label, cap)
             if result.filled:
                 exit_net = result.fill_net_price if result.fill_net_price is not None else -value
                 realized = -(g.entry_net + exit_net) * CONTRACT_MULTIPLIER * g.qty
                 logger.success("[{}] CHIUSA ({}) P&L realizzato ${:+,.2f}", label, reason, realized)
                 report.closed.append(label)
+                self._sl_streak.pop(key, None)
+                if reason == "STOP_LOSS":
+                    report.cooldown_underlyings.add(g.underlying)
                 if g.trade:
                     self.storage.close_trade(g.trade["id"], exit_price=round(exit_net, 4), pnl=round(realized, 2), reason=reason)
             else:
@@ -282,35 +360,61 @@ class RiskManager:
                 report.open_groups.append(g)
 
         report.occupied_underlyings = {g.underlying for g in report.open_groups} | self.pending_order_underlyings()
+        report.cooldown_underlyings |= self.cooldown_underlyings()
         logger.info(
             "Posizioni aperte dopo la gestione: {} / max {} | ticker occupati: {}",
             report.open_count, self.s.MAX_OPEN_POSITIONS, sorted(report.occupied_underlyings) or "-",
         )
         return report
 
-    def close_group(self, group: PositionGroup, label: str) -> "ExecutionResult":
-        """Chiude il gruppo con un ordine MLEG; se rifiutato, ripiega su ordini single-leg."""
-        from src.execution.executor import ExecutionResult, OrderLegSpec
+    def cooldown_underlyings(self) -> set[str]:
+        """Ticker chiusi in stop loss nelle ultime STOP_LOSS_COOLDOWN_HOURS ore (letti da Supabase)."""
+        if self.s.STOP_LOSS_COOLDOWN_HOURS <= 0:
+            return set()
+        since = datetime.now(timezone.utc) - timedelta(hours=self.s.STOP_LOSS_COOLDOWN_HOURS)
+        tickers = set(self.storage.get_recent_stop_tickers(since))
+        if tickers:
+            logger.info("Ticker in pausa dopo uno stop loss recente: {}", sorted(tickers))
+        return tickers
 
-        def to_spec(leg: GroupLeg) -> OrderLegSpec:
+    @staticmethod
+    def close_specs(group: PositionGroup) -> list["OrderLegSpec"]:
+        """Gambe dell'ordine di chiusura (vende le long, ricompra le short)."""
+        from src.execution.executor import OrderLegSpec
+
+        specs = []
+        for leg in group.legs:
             mark = leg.mark or 0.0
             bid = leg.bid if leg.bid is not None else mark
             ask = leg.ask if leg.ask is not None else mark
             if leg.is_long:
-                return OrderLegSpec(leg.symbol, OrderSide.SELL, PositionIntent.SELL_TO_CLOSE, leg.ratio, bid, ask)
-            return OrderLegSpec(leg.symbol, OrderSide.BUY, PositionIntent.BUY_TO_CLOSE, leg.ratio, bid, ask)
+                specs.append(OrderLegSpec(leg.symbol, OrderSide.SELL, PositionIntent.SELL_TO_CLOSE, leg.ratio, bid, ask))
+            else:
+                specs.append(OrderLegSpec(leg.symbol, OrderSide.BUY, PositionIntent.BUY_TO_CLOSE, leg.ratio, bid, ask))
+        return specs
 
-        specs = [to_spec(leg) for leg in group.legs]
-        result = self.executor.execute(specs, group.qty, f"CLOSE {label}")
-        if result.filled or result.dry_run or len(specs) == 1 or result.filled_qty > 0:
+    def close_group(self, group: PositionGroup, label: str, max_net: float | None = None) -> "ExecutionResult":
+        """
+        Chiude il gruppo con un ordine MLEG senza superare `max_net`. Solo se Alpaca RIFIUTA l'MLEG
+        (es. "uncovered short contracts") ripiega su ordini single-leg, ognuno con il proprio tetto.
+        Se invece l'ordine semplicemente non viene eseguito entro il tetto, si riprova al ciclo dopo.
+        """
+        from src.execution.executor import ExecutionResult, OrderLegSpec
+
+        specs = self.close_specs(group)
+        result = self.executor.execute(specs, group.qty, f"CLOSE {label}", max_net=max_net)
+        if result.filled or result.dry_run or len(specs) == 1 or result.filled_qty > 0 or result.status != "rejected":
             return result
 
-        logger.warning("[{}] chiusura MLEG non riuscita: provo gamba per gamba (prima le short)", label)
+        logger.warning("[{}] chiusura MLEG rifiutata: provo gamba per gamba (prima le short)", label)
         ordered = sorted(specs, key=lambda sp: sp.side != OrderSide.BUY)  # BUY_TO_CLOSE prima
+        # Il margine di slippage concesso al gruppo viene diviso tra le gambe
+        room = max(0.0, (max_net - net_mid(specs)) / len(specs)) if max_net is not None else None
         total_net, all_filled = 0.0, True
         for sp in ordered:
             single = OrderLegSpec(sp.symbol, sp.side, sp.intent, 1, sp.bid, sp.ask)
-            r = self.executor.execute([single], group.qty * sp.ratio, f"CLOSE-LEG {sp.symbol}")
+            leg_cap = single.signed_mid + room if room is not None else None
+            r = self.executor.execute([single], group.qty * sp.ratio, f"CLOSE-LEG {sp.symbol}", max_net=leg_cap)
             if not r.filled or r.fill_net_price is None:
                 all_filled = False
                 logger.error("[{}] gamba {} non chiusa: intervento manuale consigliato", label, sp.symbol)

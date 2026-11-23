@@ -280,8 +280,11 @@ class StrategySelector:
                 logger.warning("{}: {} ha debito non valido ({:.2f}), scarto", regime.ticker, strategy.value, net_mid)
                 return None
             if width > 0:
-                if debit >= width:
-                    logger.warning("{}: debito {:.2f} >= larghezza {:.2f}, scarto", regime.ticker, debit, width)
+                if debit > s.MAX_DEBIT_PCT_OF_WIDTH * width:
+                    logger.warning(
+                        "{}: debito {:.2f} > {:.0%} della larghezza {:.2f}, rapporto rischio/rendimento sfavorevole, scarto",
+                        regime.ticker, debit, s.MAX_DEBIT_PCT_OF_WIDTH, width,
+                    )
                     return None
                 max_profit = (width - debit) * CONTRACT_MULTIPLIER
             else:

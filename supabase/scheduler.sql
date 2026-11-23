@@ -55,6 +55,7 @@ declare
     c_branch      constant text := 'main';
     c_idle        constant interval := interval '12 minutes';
     v_last        timestamptz;
+    v_status      timestamptz;
     v_token       text;
     v_request_id  bigint;
 begin
@@ -62,6 +63,12 @@ begin
         coalesce((select max("timestamp") from public.equity_snapshots), 'epoch'::timestamptz),
         coalesce((select max("timestamp") from public.bot_runs), 'epoch'::timestamptz)
     ) into v_last;
+
+    -- "Battito" del bot anche mentre aspetta l'apertura (tabella facoltativa bot_status)
+    if to_regclass('public.bot_status') is not null then
+        execute 'select max(updated_at) from public.bot_status' into v_status;
+        v_last := greatest(v_last, coalesce(v_status, 'epoch'::timestamptz));
+    end if;
 
     if v_last > now() - c_idle then
         return format('bot attivo (ultimo segnale %s): nessuna azione', v_last);

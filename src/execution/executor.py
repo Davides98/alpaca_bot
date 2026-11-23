@@ -5,8 +5,10 @@ Regole:
 - MAI ordini Market: solo Limit, TimeInForce.DAY.
 - Multi-leg -> `OrderClass.MLEG` (un solo ordine atomico, limit_price netto con segno:
   > 0 = debito, < 0 = credito). Single-leg -> `OrderClass.SIMPLE` (limit_price sempre positivo).
-- Price chasing: si parte dal mid; se non eseguito entro CHASE_INTERVAL_SEC si sposta il netto di
-  CHASE_STEP (0.01$) verso il mercato, fino a MAX_CHASE_ATTEMPTS volte, poi si cancella.
+- Price chasing: si parte dal mid; se non eseguito entro CHASE_INTERVAL_SEC si sposta il netto
+  verso il mercato, fino a MAX_CHASE_ATTEMPTS volte, poi si cancella.
+- Tetto di prezzo (`max_net`): il chasing non supera mai il tetto, anche se il prezzo "naturale"
+  è più lontano (es. quote larghissime nei primi minuti dopo l'apertura).
 
 Internamente il prezzo è sempre espresso come "netto con segno" (convenzione MLEG). Spostarsi verso il
 mercato significa SEMPRE aumentare il netto: pagare un po' di più o incassare un po' di meno.
@@ -84,14 +86,37 @@ def net_natural(legs: list[OrderLegSpec]) -> float:
     return sum(leg.signed_natural for leg in legs)
 
 
-def price_ladder(start: float, natural: float, attempts: int, min_step: float, to_natural: bool = True) -> list[float]:
+def slippage_base(legs: list[OrderLegSpec], width: float = 0.0) -> float:
+    """Base su cui misurare slippage e larghezza delle quote: la larghezza dello spread, o il premio se single-leg."""
+    return width if width > 0 else max(abs(net_mid(legs)), MIN_ABS_PRICE)
+
+
+def quotes_too_wide(legs: list[OrderLegSpec], width: float, max_pct: float) -> bool:
+    """True se attraversare il mercato (naturale - mid) costa più di `max_pct` della base."""
+    return net_natural(legs) - net_mid(legs) > max_pct * slippage_base(legs, width) + 1e-9
+
+
+def price_cap(legs: list[OrderLegSpec], width: float, max_slippage_pct: float) -> float:
+    """Netto massimo accettabile: mid + max_slippage_pct della base (larghezza o premio)."""
+    return net_mid(legs) + max_slippage_pct * slippage_base(legs, width)
+
+
+def price_ladder(
+    start: float, natural: float, attempts: int, min_step: float, to_natural: bool = True, cap: float | None = None
+) -> list[float]:
     """
     Sequenza di prezzi netti per il chasing (sempre crescente = sempre più verso il mercato).
 
     to_natural=True: i tentativi sono distribuiti in modo uniforme dal mid al prezzo naturale, così
     l'ultimo tentativo è al naturale (bid per chi vende, ask per chi compra), con step minimo `min_step`.
     to_natural=False: comportamento "classico", step fissi da `min_step` (spesso troppo piccoli sugli spread).
+    cap: netto massimo da non superare mai (sostituisce il naturale se più basso).
     """
+    if cap is not None:
+        cap = round(cap, 2)
+        if cap <= round_net(start):  # il tetto è già al mid o sotto: un solo tentativo al tetto
+            return [round_net(cap)]
+        natural = min(natural, cap)
     start = round_net(start)
     ladder = [start]
     if to_natural and natural > start:
@@ -102,7 +127,10 @@ def price_ladder(start: float, natural: float, attempts: int, min_step: float, t
                 ladder.append(price)
     else:
         for _ in range(attempts):
-            ladder.append(round_net(ladder[-1] + min_step))
+            nxt = round_net(ladder[-1] + min_step)
+            if cap is not None and nxt > cap:
+                break
+            ladder.append(nxt)
     return ladder
 
 
@@ -122,14 +150,15 @@ class OrderExecutor:
     # ------------------------------------------------------------------ #
     # API pubblica
     # ------------------------------------------------------------------ #
-    def execute(self, legs: list[OrderLegSpec], qty: int, label: str) -> ExecutionResult:
-        """Esegue un ordine limit (single o multi-leg) con price chasing."""
+    def execute(self, legs: list[OrderLegSpec], qty: int, label: str, max_net: float | None = None) -> ExecutionResult:
+        """Esegue un ordine limit (single o multi-leg) con price chasing, senza mai superare `max_net`."""
         if not legs or qty < 1:
             return ExecutionResult(filled=False, message="Ordine vuoto o qty < 1")
 
         start_price = round_net(net_mid(legs))
         natural = round_net(net_natural(legs))
-        ladder = price_ladder(start_price, natural, self.s.MAX_CHASE_ATTEMPTS, self.s.CHASE_STEP, self.s.CHASE_TO_NATURAL)
+        ladder = price_ladder(start_price, natural, self.s.MAX_CHASE_ATTEMPTS, self.s.CHASE_STEP,
+                              self.s.CHASE_TO_NATURAL, cap=max_net)
         order_class = OrderClass.MLEG if len(legs) > 1 else OrderClass.SIMPLE
         kind = "DEBITO" if start_price > 0 else "CREDITO"
         legs_txt = ", ".join(f"{leg.intent.value} {leg.ratio}x {leg.symbol} (bid {leg.bid:.2f}/ask {leg.ask:.2f})" for leg in legs)
@@ -138,8 +167,9 @@ class OrderExecutor:
             label, order_class.value.upper(), qty, abs(start_price), kind, natural, legs_txt,
         )
         logger.info(
-            "[{}] Piano di chasing ({} tentativi ogni {}s): {}",
+            "[{}] Piano di chasing ({} tentativi ogni {}s): {}{}",
             label, len(ladder), self.s.CHASE_INTERVAL_SEC, " -> ".join(f"{p:+.2f}" for p in ladder),
+            f" | tetto {max_net:+.2f}" if max_net is not None else "",
         )
 
         if self.s.DRY_RUN:

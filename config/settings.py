@@ -97,6 +97,9 @@ class Settings(BaseSettings):
     DEBIT_LONG_DELTA: float = 0.60
     PREFER_SINGLE_LEG_DEBIT: bool = False  # True = Long Call/Put invece del Debit Spread
     MIN_CREDIT_PCT_OF_WIDTH: float = 0.10  # credito minimo accettabile (10% della larghezza)
+    # Debito massimo per i debit spread, in frazione della larghezza: oltre, il rapporto rischio/rendimento
+    # è sfavorevole (es. 4.15 su 5$ = 83% -> guadagno max 0.85 contro perdita max 4.15). Vale anche come tetto al chasing.
+    MAX_DEBIT_PCT_OF_WIDTH: float = Field(default=0.65, gt=0, lt=1.0)
     MAX_CONTRACTS_PER_TRADE: int = 10
 
     # ------------------------------------------------------------------ #
@@ -111,6 +114,20 @@ class Settings(BaseSettings):
     STOP_LOSS_CREDIT_PCT: float = Field(default=1.00, gt=0, le=5.0)  # -100% del credito incassato
     TAKE_PROFIT_DEBIT_PCT: float = Field(default=0.40, gt=0, le=10.0)  # +40% del debito pagato
     STOP_LOSS_DEBIT_PCT: float = Field(default=0.30, gt=0, le=1.0)  # -30% del debito pagato (il massimo è 100%)
+    # Lo stop loss scatta solo se la condizione si ripete per N controlli consecutivi (modalità sessione):
+    # evita di chiudere su un singolo prezzo anomalo.
+    STOP_LOSS_CONFIRM_CHECKS: int = Field(default=2, ge=1, le=10)
+    # Dopo uno stop loss il ticker resta in pausa (nessun nuovo trade) per queste ore.
+    STOP_LOSS_COOLDOWN_HOURS: int = Field(default=24, ge=0, le=240)
+
+    # ------------------------------------------------------------------ #
+    # Finestre di mercato
+    # ------------------------------------------------------------------ #
+    # Nei primi minuti dopo l'apertura le quote delle opzioni sono larghissime e inaffidabili:
+    # niente nuovi trade e niente take profit / stop loss (lo snapshot dell'equity continua).
+    NO_TRADE_AFTER_OPEN_MIN: int = Field(default=15, ge=0, le=120)
+    # Negli ultimi minuti prima della chiusura non apre nuovi trade (le uscite restano attive).
+    NO_NEW_TRADES_BEFORE_CLOSE_MIN: int = Field(default=10, ge=0, le=120)
 
     # ------------------------------------------------------------------ #
     # Esecuzione
@@ -122,6 +139,12 @@ class Settings(BaseSettings):
     # l'ultimo tentativo ha alta probabilità di esecuzione. False: step fissi da CHASE_STEP (spesso
     # insufficienti sugli spread multi-leg, il cui naturale dista facilmente 0.10-0.30$ dal mid).
     CHASE_TO_NATURAL: bool = True
+    # Tetto al chasing: non si paga mai più del mid + questa frazione della larghezza dello spread
+    # (per le opzioni singole: del premio). Se non viene eseguito, si riprova al ciclo successivo.
+    MAX_SLIPPAGE_PCT_OF_WIDTH: float = Field(default=0.10, ge=0, le=1.0)
+    # Quote troppo larghe: se (naturale - mid) supera questa frazione della larghezza, non si apre e
+    # non si valuta take profit / stop loss in quel ciclo.
+    MAX_QUOTE_WIDTH_PCT_OF_WIDTH: float = Field(default=0.15, gt=0, le=1.0)
     ORDER_POLL_SEC: float = 2.0
 
     # ------------------------------------------------------------------ #
@@ -145,7 +168,8 @@ class Settings(BaseSettings):
 
     @field_validator(
         "TAKE_PROFIT_CREDIT_PCT", "STOP_LOSS_CREDIT_PCT", "TAKE_PROFIT_DEBIT_PCT", "STOP_LOSS_DEBIT_PCT",
-        "MAX_RISK_PER_TRADE_PCT", mode="before",
+        "MAX_RISK_PER_TRADE_PCT", "MAX_DEBIT_PCT_OF_WIDTH", "MAX_SLIPPAGE_PCT_OF_WIDTH", "MAX_QUOTE_WIDTH_PCT_OF_WIDTH",
+        mode="before",
     )
     @classmethod
     def _parse_percent(cls, value: Any) -> Any:

@@ -22,6 +22,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
@@ -32,7 +33,7 @@ from pydantic import ValidationError
 from config.settings import PAPER_TRADING, Settings, get_settings
 from src.analysis.screener import Screener
 from src.data.market_data import MarketDataService
-from src.execution.executor import OrderExecutor, OrderLegSpec
+from src.execution.executor import OrderExecutor, OrderLegSpec, net_mid, net_natural, price_cap, quotes_too_wide
 from src.execution.risk_manager import RiskManager
 from src.storage.supabase_client import SupabaseStorage
 from src.strategy.selector import StrategySelector, TradePlan
@@ -248,6 +249,43 @@ def account_snapshot(svc: Services, verbose: bool = False) -> float:
     return equity
 
 
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+@dataclass
+class TradingWindow:
+    exits_allowed: bool  # take profit / stop loss / DTE
+    new_trades_allowed: bool
+    reason: str = ""
+    resume_at: datetime | None = None  # quando finisce la pausa (UTC)
+
+
+def trading_window(now: datetime, next_close: datetime | None, settings: Settings) -> TradingWindow:
+    """
+    Finestre in cui il bot NON opera, anche a mercato aperto:
+      - primi NO_TRADE_AFTER_OPEN_MIN minuti dopo l'apertura (9:30 New York): quote delle opzioni
+        larghissime e inaffidabili -> niente nuovi trade e niente take profit / stop loss;
+      - ultimi NO_NEW_TRADES_BEFORE_CLOSE_MIN minuti prima della chiusura -> niente nuovi trade.
+    """
+    ny = now.astimezone(NEW_YORK)
+    opening = ny.replace(hour=9, minute=30, second=0, microsecond=0)
+    resume = opening + timedelta(minutes=settings.NO_TRADE_AFTER_OPEN_MIN)
+    if opening <= ny < resume:
+        return TradingWindow(
+            False, False,
+            f"primi {settings.NO_TRADE_AFTER_OPEN_MIN} min dopo l'apertura (quote inaffidabili): "
+            f"si opera dalle {resume:%H:%M} di New York",
+            resume.astimezone(timezone.utc),
+        )
+    if next_close is not None:
+        to_close_min = (next_close - now).total_seconds() / 60
+        if to_close_min <= settings.NO_NEW_TRADES_BEFORE_CLOSE_MIN:
+            return TradingWindow(
+                True, False, f"ultimi {settings.NO_NEW_TRADES_BEFORE_CLOSE_MIN} min prima della chiusura: niente nuovi trade"
+            )
+    return TradingWindow(True, True)
+
+
 def refresh_cycle(svc: Services, stats: SessionStats) -> None:
     """Ciclo leggero (ogni REFRESH_INTERVAL_SEC): P&L posizioni + controllo TP/SL/DTE."""
     report = svc.risk.manage_open_positions()
@@ -255,7 +293,10 @@ def refresh_cycle(svc: Services, stats: SessionStats) -> None:
     stats.refresh_cycles += 1
 
 
-def trading_cycle(settings: Settings, svc: Services, run_id: str, equity: float, stats: SessionStats) -> str:
+def trading_cycle(
+    settings: Settings, svc: Services, run_id: str, equity: float, stats: SessionStats,
+    allow_new_trades: bool = True, pause_reason: str = "",
+) -> str:
     """Ciclo completo: gestione posizioni + screening + nuovi trade. Ritorna il riepilogo testuale."""
     storage, market, executor, selector = svc.storage, svc.market, svc.executor, svc.selector
 
@@ -265,7 +306,7 @@ def trading_cycle(settings: Settings, svc: Services, run_id: str, equity: float,
 
     # Screening
     screener = Screener(settings, market)
-    output = screener.run(occupied=report.occupied_underlyings)
+    output = screener.run(occupied=report.occupied_underlyings | report.cooldown_underlyings)
     slots = min(settings.MAX_NEW_TRADES_PER_RUN, settings.MAX_OPEN_POSITIONS - report.open_count)
 
     # Lo screener pre-seleziona i migliori: qui la selezione diventa definitiva
@@ -273,11 +314,17 @@ def trading_cycle(settings: Settings, svc: Services, run_id: str, equity: float,
         if row.selected:
             row.selected = False
             row.reason = "Idoneo"
+        if row.ticker in report.cooldown_underlyings and row.ticker not in report.occupied_underlyings:
+            row.reason = f"In pausa dopo uno stop loss (per {settings.STOP_LOSS_COOLDOWN_HOURS} ore)"
 
     # Nuovi trade
     opened = 0  # ordini tentati
     filled = 0  # ordini effettivamente eseguiti
-    if slots <= 0:
+    if not allow_new_trades:
+        logger.info("Nessun nuovo trade in questo ciclo: {}", pause_reason)
+        for cand in output.ranked:
+            cand.row.reason = f"Idoneo, ma {pause_reason}"
+    elif slots <= 0:
         logger.info("Nessuno slot libero ({} posizioni aperte, max {}): non apro nuovi trade",
                     report.open_count, settings.MAX_OPEN_POSITIONS)
         for cand in output.ranked:
@@ -307,7 +354,18 @@ def trading_cycle(settings: Settings, svc: Services, run_id: str, equity: float,
                         logger.info("Quote aggiornate {}: {:.2f}/{:.2f} -> {:.2f}/{:.2f}", leg.symbol, leg.bid, leg.ask, bid, ask)
                     leg.bid, leg.ask = bid, ask
 
-            result = executor.execute(order_legs, plan.qty, f"OPEN {plan.ticker} {plan.strategy.value}")
+            # Quote troppo larghe: attraversare il mercato costerebbe troppo, si riprova al prossimo ciclo
+            if quotes_too_wide(order_legs, plan.width, settings.MAX_QUOTE_WIDTH_PCT_OF_WIDTH):
+                msg = (f"quote troppo larghe (mid {net_mid(order_legs):+.2f}, naturale {net_natural(order_legs):+.2f}, "
+                       f"max {settings.MAX_QUOTE_WIDTH_PCT_OF_WIDTH:.0%} della larghezza)")
+                logger.warning("[OPEN {}] Non apro: {}", plan.ticker, msg)
+                cand.row.reason += f" - NON inviato: {msg}"
+                continue
+            # Tetto di prezzo: mid + slippage massima; per i debit spread mai oltre MAX_DEBIT_PCT_OF_WIDTH
+            cap = price_cap(order_legs, plan.width, settings.MAX_SLIPPAGE_PCT_OF_WIDTH)
+            if not plan.is_credit and plan.width > 0:
+                cap = min(cap, settings.MAX_DEBIT_PCT_OF_WIDTH * plan.width)
+            result = executor.execute(order_legs, plan.qty, f"OPEN {plan.ticker} {plan.strategy.value}", max_net=cap)
             opened += 1
             if result.dry_run:
                 cand.row.reason += f" (DRY_RUN, non inviato: {result.message})"
@@ -341,9 +399,12 @@ def wait_for_open(settings: Settings, trading: TradingClient, ctx: RunContext | 
     wait_s = (clock.next_open - clock.timestamp).total_seconds()
     if 0 < wait_s <= settings.SESSION_WAIT_FOR_OPEN_MIN * 60:
         logger.info("Mercato chiuso, apre tra {:.0f} minuti: attendo l'apertura", wait_s / 60)
-        if ctx is not None and ctx.bot_status is not None:
-            ctx.bot_status.publish("WAITING_OPEN", clock, f"In attesa dell'apertura ({wait_s / 60:.0f} min)")
-        time.sleep(wait_s + 15)
+        # Attesa a blocchi di 60 s con un "battito" su bot_status: lo scheduler vede che il bot è vivo
+        end = time.monotonic() + wait_s + 15
+        while (left := end - time.monotonic()) > 0:
+            if ctx is not None and ctx.bot_status is not None:
+                ctx.bot_status.publish("WAITING_OPEN", clock, f"In attesa dell'apertura ({left / 60:.0f} min)")
+            time.sleep(min(60.0, left))
         clock = trading.get_clock()
         if ctx is not None:
             ctx.last_clock = clock
@@ -367,6 +428,7 @@ def run_session(settings: Settings, ctx: RunContext, svc: Services) -> str:
     next_trading = 0.0
     consecutive_errors = 0
     end_reason = ""
+    pause_logged = False
     logger.info(
         "Modalità SESSIONE: aggiornamento ogni {}s, trading ogni {} min, durata massima {} min",
         settings.REFRESH_INTERVAL_SEC, settings.TRADE_INTERVAL_MIN, settings.SESSION_MAX_MINUTES,
@@ -386,9 +448,19 @@ def run_session(settings: Settings, ctx: RunContext, svc: Services) -> str:
                 end_reason = "mercato chiuso"
                 break
             equity = account_snapshot(svc, verbose=stats.trading_cycles == 0)
-            if tick >= next_trading:
+            window = TradingWindow(True, True) if test_mode else trading_window(
+                datetime.now(timezone.utc), clock.next_close, settings)
+            if not window.exits_allowed:
+                # Pausa dopo l'apertura: solo snapshot dell'equity, nessuna decisione sulle posizioni
+                if not pause_logged:
+                    logger.info("Pausa operativa: {}", window.reason)
+                    pause_logged = True
+                status.next_trade_cycle_at = window.resume_at
+                status.publish("RUNNING", clock, f"Pausa: {window.reason}")
+            elif tick >= next_trading:
                 logger.info("----- Ciclo di trading #{} -----", stats.trading_cycles + 1)
-                summary = trading_cycle(settings, svc, ctx.run_id, equity, stats)
+                summary = trading_cycle(settings, svc, ctx.run_id, equity, stats,
+                                        window.new_trades_allowed, window.reason)
                 logger.info("Ciclo di trading #{}: {}", stats.trading_cycles, summary)
                 svc.storage.log_run(ctx.run_id, "OK", f"[ciclo {stats.trading_cycles}] {summary}", settings.DRY_RUN)
                 next_trading = tick + settings.TRADE_INTERVAL_MIN * 60
@@ -401,7 +473,8 @@ def run_session(settings: Settings, ctx: RunContext, svc: Services) -> str:
                     break
             else:
                 refresh_cycle(svc, stats)
-            status.publish("RUNNING", clock, f"Sessione in corso: {stats.trading_cycles} cicli di trading")
+            if window.exits_allowed:
+                status.publish("RUNNING", clock, f"Sessione in corso: {stats.trading_cycles} cicli di trading")
             consecutive_errors = 0
         except APIError as exc:
             if getattr(exc, "status_code", None) in (401, 403):
@@ -484,7 +557,15 @@ def run(settings: Settings, ctx: RunContext) -> int:
         summary = run_session(settings, ctx, svc)
     else:
         equity = account_snapshot(svc, verbose=True)
-        summary = trading_cycle(settings, svc, run_id, equity, SessionStats())
+        test_mode = settings.DRY_RUN and settings.IGNORE_MARKET_HOURS
+        clock = ctx.last_clock
+        window = TradingWindow(True, True) if test_mode or clock is None else trading_window(
+            datetime.now(timezone.utc), clock.next_close, settings)
+        if not window.exits_allowed:
+            logger.info("Pausa operativa: {}. Nessuna operazione in questo run.", window.reason)
+            ctx.finish("OK", f"Pausa operativa: {window.reason}")
+            return 0
+        summary = trading_cycle(settings, svc, run_id, equity, SessionStats(), window.new_trades_allowed, window.reason)
     logger.info("=" * 70)
     logger.info("Fine run {} | {}", run_id, summary)
     logger.info("=" * 70)

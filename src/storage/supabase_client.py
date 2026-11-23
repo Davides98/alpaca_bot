@@ -154,6 +154,15 @@ class SupabaseStorage:
             [],
         )
 
+    def get_recent_stop_tickers(self, since: datetime) -> list[str]:
+        """Ticker dei trade chiusi in STOP_LOSS dopo `since` (per la pausa post stop loss)."""
+        def _do() -> list[str]:
+            res = (self.client.table("trades").select("ticker")
+                   .eq("close_reason", "STOP_LOSS").gte("closed_at", since.isoformat()).execute())
+            return [r["ticker"] for r in (res.data or [])]
+
+        return self._safe("trades.select_recent_stops", _do, [])
+
     def update_trade(self, trade_id: int, fields: dict[str, Any]) -> None:
         payload = {**fields, "updated_at": _now_iso()}
         self._safe("trades.update", lambda: self.client.table("trades").update(payload).eq("id", trade_id).execute(), None)

@@ -88,6 +88,14 @@ La scadenza scelta è quella più vicina al centro della finestra `MIN_DTE`–`M
   - debito: TP a +40%, SL a −30%;
   - sempre: chiusura con `DTE <= 7`.
 - **Ordini:** solo Limit `DAY`. Si parte dal mid-price; ogni 15 s senza esecuzione il prezzo si avvicina al mercato, con 3 tentativi distribuiti fino al **prezzo naturale** (vendi al bid, compri all'ask), poi l'ordine viene cancellato. Con `CHASE_TO_NATURAL=false` si torna agli step fissi da 0.01$. Il chasing usa prima `replace_order_by_id` e, se Alpaca non lo accetta, ripiega su cancel + nuovo ordine.
+- **Protezioni sull'esecuzione** (introdotte dopo i trade QQQ e GLD del 23/11/2026, chiusi in forte perdita nei primi minuti di mercato per quote larghissime):
+  - **pausa dopo l'apertura:** nei primi `NO_TRADE_AFTER_OPEN_MIN` minuti (15) il bot salva solo l'equity, senza nuovi trade e senza take profit o stop loss; negli ultimi `NO_NEW_TRADES_BEFORE_CLOSE_MIN` minuti (10) non apre nuovi trade;
+  - **tetto al chasing:** non paga mai più del mid + `MAX_SLIPPAGE_PCT_OF_WIDTH` (10%) della larghezza dello spread. Per i debit spread il tetto è anche `MAX_DEBIT_PCT_OF_WIDTH` (65%) della larghezza. Se l'ordine non viene eseguito, si riprova al ciclo successivo;
+  - **take profit coerente:** l'ordine di chiusura non supera mai il prezzo che realizza la soglia di profitto, quindi un take profit non può diventare una perdita;
+  - **quote affidabili:** se attraversare il mercato costa più di `MAX_QUOTE_WIDTH_PCT_OF_WIDTH` (15%) della larghezza, il bot non apre e rimanda take profit e stop loss. Lo stop loss viene rimandato al massimo per 15 controlli di fila;
+  - **stop loss confermato:** in sessione scatta solo dopo `STOP_LOSS_CONFIRM_CHECKS` (2) controlli consecutivi;
+  - **pausa dopo uno stop:** il ticker non viene ritradato per `STOP_LOSS_COOLDOWN_HOURS` (24) ore;
+  - **ripiego gamba per gamba** solo se Alpaca *rifiuta* l'ordine multi-leg, mai per una semplice mancata esecuzione.
 - **Convenzione prezzi** (come Alpaca per gli ordini `MLEG`): un prezzo netto **positivo è un debito**, uno **negativo è un credito**. Nella dashboard: `1,42 CR` = credito incassato, `2,10 DB` = debito pagato.
 
 Esempio di ordine multi-leg generato (Bull Put Spread a credito):
@@ -298,6 +306,13 @@ Vai in **Settings → Secrets and variables → Actions** e crea un **Secret** o
 | `STOP_LOSS_CREDIT_PCT` | `1.00` | chiude una posizione a credito quando la perdita arriva a questa % del credito |
 | `TAKE_PROFIT_DEBIT_PCT` | `0.40` | chiude una posizione a debito quando il guadagno arriva a questa % del debito pagato |
 | `STOP_LOSS_DEBIT_PCT` | `0.30` | chiude una posizione a debito quando la perdita arriva a questa % del debito |
+| `NO_TRADE_AFTER_OPEN_MIN` | `15` | minuti dopo l'apertura senza nuovi trade né take profit / stop loss (quote inaffidabili) |
+| `NO_NEW_TRADES_BEFORE_CLOSE_MIN` | `10` | minuti prima della chiusura senza nuovi trade |
+| `MAX_SLIPPAGE_PCT_OF_WIDTH` | `0.10` | slippage massima rispetto al mid, in frazione della larghezza dello spread (o del premio) |
+| `MAX_QUOTE_WIDTH_PCT_OF_WIDTH` | `0.15` | oltre questo costo di attraversamento (naturale − mid) le quote sono considerate inaffidabili |
+| `MAX_DEBIT_PCT_OF_WIDTH` | `0.65` | debito massimo di un debit spread rispetto alla sua larghezza |
+| `STOP_LOSS_CONFIRM_CHECKS` | `2` | controlli consecutivi necessari per far scattare lo stop loss (in sessione) |
+| `STOP_LOSS_COOLDOWN_HOURS` | `24` | ore di pausa su un ticker dopo uno stop loss (`0` = nessuna pausa) |
 | `REFRESH_INTERVAL_SEC` | `60` | ogni quanto, in sessione, aggiorna equity e P&L e controlla le soglie (da 30 a 600 s) |
 | `TRADE_INTERVAL_MIN` | `10` | ogni quanto, in sessione, fa screening e nuovi trade |
 
