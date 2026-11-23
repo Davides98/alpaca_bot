@@ -392,7 +392,8 @@ class _FakeExecutor:
         self.calls.append((label, qty, max_net))
         if self.status == "filled":
             price = min(net_mid(legs), max_net) if max_net is not None else net_mid(legs)
-            return ExecutionResult(filled=True, filled_qty=qty, fill_net_price=price, status="filled")
+            return ExecutionResult(filled=True, filled_qty=qty, fill_net_price=price, status="filled",
+                                   leg_fills={leg.symbol: round(leg.mid, 2) for leg in legs})
         return ExecutionResult(filled=False, status=self.status)
 
 
@@ -422,8 +423,9 @@ def _risk_manager(quotes: dict, executor, session: bool = True):
         def update_trade(self, *a):
             pass
 
-        def close_trade(self, trade_id, exit_price, pnl, reason):
+        def close_trade(self, trade_id, exit_price, pnl, reason, legs_json=None):
             self.closed.append((trade_id, exit_price, pnl, reason))
+            self.legs_json = legs_json
 
         def get_recent_stop_tickers(self, since):
             return []
@@ -449,6 +451,8 @@ def test_risk_manager_take_profit_closes_with_profit_cap() -> None:
     assert len(ex.calls) == 1 and ex.calls[0][2] <= 0.665 + 1e-9
     trade_id, exit_price, pnl, reason = storage.closed[0]
     assert reason == "TAKE_PROFIT" and pnl > 0
+    exit_fills = {leg["symbol"]: leg["exit_fill"] for leg in storage.legs_json["legs"]}
+    assert exit_fills == {"QQQ261224C00695000": 0.6, "QQQ261224C00700000": 0.23}
 
 
 def test_risk_manager_stop_loss_needs_confirmation_and_no_leg_fallback() -> None:

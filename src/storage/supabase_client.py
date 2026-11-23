@@ -167,16 +167,19 @@ class SupabaseStorage:
         payload = {**fields, "updated_at": _now_iso()}
         self._safe("trades.update", lambda: self.client.table("trades").update(payload).eq("id", trade_id).execute(), None)
 
-    def close_trade(self, trade_id: int, exit_price: float | None, pnl: float | None, reason: str) -> None:
-        self.update_trade(
-            trade_id,
-            {
-                "status": "CLOSED",
-                "closed_at": _now_iso(),
-                "exit_price": exit_price,
-                "pnl": pnl,
-                "unrealized_pnl": None,
-                "close_reason": reason,
-            },
-        )
+    def close_trade(
+        self, trade_id: int, exit_price: float | None, pnl: float | None, reason: str,
+        legs_json: dict[str, Any] | None = None,
+    ) -> None:
+        fields: dict[str, Any] = {
+            "status": "CLOSED",
+            "closed_at": _now_iso(),
+            "exit_price": exit_price,
+            "pnl": pnl,
+            "unrealized_pnl": None,
+            "close_reason": reason,
+        }
+        if legs_json is not None:  # aggiunge il prezzo di chiusura di ogni gamba
+            fields["legs_json"] = legs_json
+        self.update_trade(trade_id, fields)
         logger.info("Trade #{} marcato CLOSED ({})", trade_id, reason)

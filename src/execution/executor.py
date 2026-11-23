@@ -76,6 +76,7 @@ class ExecutionResult:
     history: list[str] = field(default_factory=list)
     ladder: list[float] = field(default_factory=list)  # prezzi netti tentati
     natural: float | None = None
+    leg_fills: dict[str, float] = field(default_factory=dict)  # prezzo medio eseguito per gamba (sempre positivo)
 
 
 def net_mid(legs: list[OrderLegSpec]) -> float:
@@ -232,6 +233,7 @@ class OrderExecutor:
                 order_price = self._fill_net_price(order, order_class) or price
                 filled_total += order_filled
                 fill_value += order_price * order_filled
+                result.leg_fills = self._leg_fills(order, order_class, legs)
             result.order_id = str(order.id)
             result.status = order.status.value
 
@@ -335,6 +337,18 @@ class OrderExecutor:
         except APIError as exc:
             logger.error("[{}] Nuovo ordine rifiutato: {}", label, exc)
             return None, old_filled, old_value
+
+    @staticmethod
+    def _leg_fills(order: Order, order_class: OrderClass, legs: list[OrderLegSpec]) -> dict[str, float]:
+        """Prezzo medio di esecuzione di ogni gamba, per mostrarlo in dashboard."""
+        fills: dict[str, float] = {}
+        if order_class == OrderClass.MLEG:
+            for leg in order.legs or []:
+                if leg.symbol and leg.filled_avg_price is not None:
+                    fills[leg.symbol] = round(float(leg.filled_avg_price), 4)
+        elif order.filled_avg_price is not None and legs:
+            fills[legs[0].symbol] = round(float(order.filled_avg_price), 4)
+        return fills
 
     @staticmethod
     def _fill_net_price(order: Order, order_class: OrderClass) -> float | None:

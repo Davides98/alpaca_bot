@@ -101,7 +101,7 @@
   </style>
 </head>
 <body class="min-h-screen">
-  <main class="max-w-6xl mx-auto px-4 sm:px-6 py-6 sm:py-10 space-y-6">
+  <main class="max-w-7xl mx-auto px-4 sm:px-6 py-6 sm:py-10 space-y-6">
 
     <!-- Header -->
     <header class="flex flex-wrap items-end justify-between gap-4">
@@ -228,14 +228,16 @@
         <table>
           <thead>
             <tr>
-              <th>Apertura</th><th>Ticker</th><th>Strategia</th><th>Stato</th>
-              <th class="r">Qty</th><th class="r">DTE</th><th class="r">Costo</th><th class="r">Rischio max</th><th class="r">P&amp;L</th><th>Motivo chiusura</th>
+              <th>Apertura</th><th>Ticker</th><th>Strategia</th>
+              <th class="r">Qty</th><th class="r">DTE</th><th class="r">Prezzo entrata</th><th class="r">Uscita / attuale</th><th class="r">Costo</th><th class="r">Rischio max</th><th class="r">P&amp;L</th>
             </tr>
           </thead>
           <tbody id="tradesTable"></tbody>
         </table>
       </div>
       <p class="text-xs muted px-5 py-3" style="border-top: 1px solid var(--border);">
+        <strong class="t2">Prezzo entrata / uscita</strong>: prezzo netto per azione dell'ordine eseguito (DB = debito pagato, CR = credito incassato) e, sotto, il prezzo di ogni gamba
+        (eseguito, oppure "mid" = prezzo medio al segnale per i trade registrati prima di questa funzione). Per le posizioni aperte, "attuale" è il valore stimato dall'ultimo controllo del bot.
         <strong class="t2">Costo</strong>: soldi pagati (debito) o incassati (credito) all'apertura = prezzo netto × 100 × contratti; per i trade chiusi c'è anche il costo della chiusura.
         <strong class="t2">Rischio max</strong>: quanto puoi perdere al massimo con quel trade (per i crediti è il capitale bloccato come margine).
         Eventuali commissioni o fee non sono incluse.
@@ -578,7 +580,23 @@
       const main = price < 0
         ? `<span class="good">+${amount}</span> <span class="muted text-xs">incassati</span>`
         : `<span>−${amount}</span> <span class="muted text-xs">pagati</span>`;
-      return `<div>${main}</div><div class="muted text-xs">${price < 0 ? "credito" : "debito"} ${num2.format(Math.abs(price))} × 100 × ${esc(qty ?? 1)}</div>`;
+      return `<div>${main}</div>`;  // il prezzo per azione è nella colonna "Prezzo entrata"
+    }
+    // Prezzo netto per azione: "4,00 DB" (debito pagato) / "1,25 CR" (credito incassato)
+    const netPriceText = (price) => `${num2.format(Math.abs(price))} <span class="muted text-xs">${price < 0 ? "CR" : "DB"}</span>`;
+    // Prezzo di ogni gamba: eseguito (campo `field`) se il bot l'ha salvato, altrimenti il mid al segnale
+    function legPricesHtml(legs, field, fallbackToMid) {
+      if (!legs?.length) return "";
+      const lines = legs.map((l) => {
+        const name = `${l.side === "buy" ? "+" : "−"}${l.type === "call" ? "C" : "P"}${l.strike}`;
+        let price = l[field], tag = "";
+        if ((price === null || price === undefined) && fallbackToMid && l.bid !== undefined && l.ask !== undefined) {
+          price = (Number(l.bid) + Number(l.ask)) / 2;
+          tag = " mid";
+        }
+        return price === null || price === undefined ? null : `${name} @ ${num2.format(Number(price))}${tag}`;
+      }).filter(Boolean);
+      return lines.length ? `<div class="muted text-xs">${lines.join("<br>")}</div>` : "";
     }
     // Perdita massima del trade in $ calcolata sul prezzo REALE di esecuzione:
     //   debito -> il debito pagato; credito su spread -> (larghezza - credito) x 100 x qty
@@ -632,17 +650,33 @@
           : `<div><span class="${cls(Number(pnl))}">${arrow(Number(pnl))}${fmtUsd(Number(pnl))}</span></div>` +
             `<div class="muted text-xs">${pnlPct !== null ? `${fmtPct(pnlPct)} del ${entry < 0 ? "credito" : "debito"}` : ""}${isOpen ? " · non real." : ""}</div>`;
         const legs = (t.legs_json?.legs || []).map((l) => `${l.side === "buy" ? "+" : "−"}${l.type === "call" ? "C" : "P"}${l.strike}`).join(" ");
+        const entryTxt = `<div class="font-semibold">${netPriceText(entry)}</div>${legPricesHtml(t.legs_json?.legs, "fill", true)}`;
+        let exitTxt;
+        if (!isOpen && t.exit_price !== null && t.exit_price !== undefined) {
+          exitTxt = `<div class="font-semibold">${netPriceText(Number(t.exit_price))}</div>` +
+            (t.closed_at ? `<div class="muted text-xs">${dtShortFmt.format(new Date(t.closed_at))}</div>` : "") +
+            (t.close_reason ? `<div class="text-xs t2">${esc(prettyStrategy(t.close_reason))}</div>` : "") +
+            legPricesHtml(t.legs_json?.legs, "exit_fill", false);
+        } else if (isOpen && t.unrealized_pnl !== null && t.unrealized_pnl !== undefined) {
+          // valore attuale per azione = entrata + P&L non realizzato / (100 x contratti)
+          const value = entry + Number(t.unrealized_pnl) / (100 * Number(t.qty || 1));
+          exitTxt = entry < 0
+            ? `<div>${num2.format(Math.max(0, -value))}</div><div class="muted text-xs">costo per chiudere ora</div>`
+            : `<div>${num2.format(Math.max(0, value))}</div><div class="muted text-xs">valore attuale</div>`;
+        } else {
+          exitTxt = `<span class="muted">–</span>`;
+        }
         return `<tr>
           <td class="num">${dtFmt.format(new Date(t.created_at))}</td>
-          <td class="font-semibold">${esc(t.ticker)}</td>
-          <td><div>${esc(prettyStrategy(t.strategy))}</div><div class="muted text-xs num">${esc(legs)}${t.legs_json?.expiration ? " · " + esc(t.legs_json.expiration) : ""}</div></td>
-          <td><span class="pill ${isOpen ? "open" : ""}"><span class="dot"></span>${isOpen ? "OPEN" : "CLOSED"}</span></td>
+          <td><div class="font-semibold">${esc(t.ticker)}</div><span class="pill ${isOpen ? "open" : ""}" style="margin-top:4px"><span class="dot"></span>${isOpen ? "OPEN" : "CLOSED"}</span></td>
+          <td style="white-space:normal;min-width:150px;max-width:190px"><div>${esc(prettyStrategy(t.strategy))}</div><div class="muted text-xs num">${esc(legs)}${t.legs_json?.expiration ? " · " + esc(t.legs_json.expiration) : ""}</div></td>
           <td class="r num">${esc(t.qty ?? "–")}</td>
           <td class="r num">${esc(t.dte ?? "–")}</td>
+          <td class="r num">${entryTxt}</td>
+          <td class="r num">${exitTxt}</td>
           <td class="r num">${costTxt}</td>
           <td class="r num">${riskTxt}</td>
           <td class="r num">${pnlTxt}</td>
-          <td class="t2">${esc(prettyStrategy(t.close_reason) || "–")}</td>
         </tr>`;
       }).join("");
     }

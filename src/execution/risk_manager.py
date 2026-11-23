@@ -353,7 +353,8 @@ class RiskManager:
                 if reason == "STOP_LOSS":
                     report.cooldown_underlyings.add(g.underlying)
                 if g.trade:
-                    self.storage.close_trade(g.trade["id"], exit_price=round(exit_net, 4), pnl=round(realized, 2), reason=reason)
+                    self.storage.close_trade(g.trade["id"], exit_price=round(exit_net, 4), pnl=round(realized, 2), reason=reason,
+                                             legs_json=self._with_exit_fills(g.trade, result.leg_fills))
             else:
                 if result.dry_run:
                     report.closed.append(f"{label} (DRY_RUN)")
@@ -366,6 +367,15 @@ class RiskManager:
             report.open_count, self.s.MAX_OPEN_POSITIONS, sorted(report.occupied_underlyings) or "-",
         )
         return report
+
+    @staticmethod
+    def _with_exit_fills(trade: dict[str, Any], fills: dict[str, float]) -> dict[str, Any] | None:
+        """legs_json del trade con il prezzo di chiusura di ogni gamba (None se non ci sono prezzi)."""
+        if not fills:
+            return None
+        legs_json = dict(trade.get("legs_json") or {})
+        legs_json["legs"] = [{**leg, "exit_fill": fills.get(leg.get("symbol"))} for leg in legs_json.get("legs", [])]
+        return legs_json
 
     def cooldown_underlyings(self) -> set[str]:
         """Ticker chiusi in stop loss nelle ultime STOP_LOSS_COOLDOWN_HOURS ore (letti da Supabase)."""
@@ -411,6 +421,7 @@ class RiskManager:
         # Il margine di slippage concesso al gruppo viene diviso tra le gambe
         room = max(0.0, (max_net - net_mid(specs)) / len(specs)) if max_net is not None else None
         total_net, all_filled = 0.0, True
+        leg_fills: dict[str, float] = {}
         for sp in ordered:
             single = OrderLegSpec(sp.symbol, sp.side, sp.intent, 1, sp.bid, sp.ask)
             leg_cap = single.signed_mid + room if room is not None else None
@@ -420,10 +431,12 @@ class RiskManager:
                 logger.error("[{}] gamba {} non chiusa: intervento manuale consigliato", label, sp.symbol)
                 break
             total_net += r.fill_net_price * sp.ratio
+            leg_fills.update(r.leg_fills)
         return ExecutionResult(
             filled=all_filled,
             filled_qty=group.qty if all_filled else 0,
             fill_net_price=total_net if all_filled else None,
             status="filled" if all_filled else "partial_legs",
             message="Chiusura gamba per gamba",
+            leg_fills=leg_fills,
         )

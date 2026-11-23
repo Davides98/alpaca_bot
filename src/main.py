@@ -79,7 +79,10 @@ def plan_to_order_legs(plan: TradePlan) -> list[OrderLegSpec]:
     return legs
 
 
-def plan_to_trade_row(plan: TradePlan, entry_price: float, qty: int, order_id: str | None) -> dict[str, Any]:
+def plan_to_trade_row(
+    plan: TradePlan, entry_price: float, qty: int, order_id: str | None, leg_fills: dict[str, float] | None = None
+) -> dict[str, Any]:
+    fills = leg_fills or {}
     return {
         "ticker": plan.ticker,
         "strategy": plan.strategy.value,
@@ -104,6 +107,7 @@ def plan_to_trade_row(plan: TradePlan, entry_price: float, qty: int, order_id: s
                     "delta": leg.delta,
                     "bid": leg.bid,
                     "ask": leg.ask,
+                    "fill": fills.get(leg.symbol),  # prezzo eseguito della gamba
                 }
                 for leg in plan.legs
             ],
@@ -371,7 +375,8 @@ def trading_cycle(
                 cand.row.reason += f" (DRY_RUN, non inviato: {result.message})"
             elif result.filled_qty > 0 and result.fill_net_price is not None:
                 filled += 1
-                storage.insert_trade(plan_to_trade_row(plan, result.fill_net_price, result.filled_qty, result.order_id))
+                storage.insert_trade(plan_to_trade_row(plan, result.fill_net_price, result.filled_qty, result.order_id,
+                                                       result.leg_fills))
                 cand.row.reason += f" - ESEGUITO {result.filled_qty} @ {result.fill_net_price:+.2f}"
             else:
                 cand.row.reason += f" - NON eseguito: {result.message}"
