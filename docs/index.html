@@ -98,6 +98,25 @@
     .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; }
     .kv dt { color: var(--muted); white-space: nowrap; }
     .kv dd { color: var(--text-2); min-width: 0; }
+    /* Pulsante "i" e scheda didattica della strategia */
+    .info-btn { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%;
+                border: 1px solid var(--border); background: var(--surface-2); color: var(--series); font: 600 11px/1 Georgia, serif;
+                font-style: italic; cursor: pointer; flex: none; }
+    .info-btn:hover, .info-btn:focus-visible { background: var(--accent-soft); outline: none; border-color: var(--series); }
+    dialog.sheet { background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 14px; padding: 0;
+                   width: min(760px, calc(100vw - 32px)); max-height: calc(100vh - 48px); overflow: auto; }
+    dialog.sheet::backdrop { background: rgba(0, 0, 0, .45); }
+    .sheet-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 18px 20px 12px;
+                  border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--surface); z-index: 1; }
+    .sheet-body { padding: 4px 20px 20px; font-size: 14px; }
+    .sheet-body h3 { font-weight: 600; font-size: 14px; margin: 18px 0 6px; color: var(--text); }
+    .sheet-body p { color: var(--text-2); line-height: 1.55; }
+    .sheet-body ul { list-style: disc; padding-left: 20px; color: var(--text-2); line-height: 1.55; }
+    .sheet-body li + li { margin-top: 3px; }
+    .sheet .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--border); color: var(--text-2); margin-right: 4px; }
+    .rule { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-top: 8px; background: var(--surface-2); }
+    .rule strong { color: var(--text); }
+    .payoff { width: 100%; height: auto; display: block; margin-top: 8px; }
   </style>
 </head>
 <body class="min-h-screen">
@@ -262,6 +281,18 @@
         </table>
       </div>
     </section>
+
+    <dialog id="stratDialog" class="sheet" aria-labelledby="stratTitle">
+      <div class="sheet-head">
+        <div>
+          <div class="text-xs muted uppercase tracking-wider">Scheda didattica</div>
+          <h2 id="stratTitle" class="text-lg font-semibold mt-1">–</h2>
+          <div id="stratTags" class="mt-2"></div>
+        </div>
+        <button class="btn" id="stratClose" type="button" aria-label="Chiudi la scheda">Chiudi</button>
+      </div>
+      <div id="stratBody" class="sheet-body"></div>
+    </dialog>
 
     <footer class="text-xs muted text-center pb-4">
       Progetto didattico. Nessun consiglio finanziario. Dati da Supabase (sola lettura, chiave anon).
@@ -669,7 +700,7 @@
         return `<tr>
           <td class="num">${dtFmt.format(new Date(t.created_at))}</td>
           <td><div class="font-semibold">${esc(t.ticker)}</div><span class="pill ${isOpen ? "open" : ""}" style="margin-top:4px"><span class="dot"></span>${isOpen ? "OPEN" : "CLOSED"}</span></td>
-          <td style="white-space:normal;min-width:150px;max-width:190px"><div>${esc(prettyStrategy(t.strategy))}</div><div class="muted text-xs num">${esc(legs)}${t.legs_json?.expiration ? " · " + esc(t.legs_json.expiration) : ""}</div></td>
+          <td style="white-space:normal;min-width:150px;max-width:190px"><div class="flex items-center gap-1.5">${esc(prettyStrategy(t.strategy))}${infoButton(t.strategy, t.id)}</div><div class="muted text-xs num">${esc(legs)}${t.legs_json?.expiration ? " · " + esc(t.legs_json.expiration) : ""}</div></td>
           <td class="r num">${esc(t.qty ?? "–")}</td>
           <td class="r num">${esc(t.dte ?? "–")}</td>
           <td class="r num">${entryTxt}</td>
@@ -680,6 +711,273 @@
         </tr>`;
       }).join("");
     }
+
+    // ------------------------------------------------------------------ //
+    // Schede didattiche delle strategie (pulsante "i")
+    // ------------------------------------------------------------------ //
+    // Soglie di uscita di default del bot (config/settings.py). I trade aperti dopo questa versione salvano
+    // le soglie effettive in legs_json.exit_rules; per quelli precedenti si usano questi valori.
+    const EXIT_DEFAULTS = { tp_credit: 0.50, sl_credit: 1.00, tp_debit: 0.40, sl_debit: 0.50, close_dte: 7, sl_confirm: 2, pause_after_open_min: 15 };
+
+    const STRATEGY_INFO = {
+      IRON_CONDOR: {
+        kind: "credit", view: "Laterale", vol: "Volatilità alta",
+        what: "Vendi contemporaneamente un put spread sotto il prezzo attuale e un call spread sopra, incassando due crediti. " +
+              "Guadagni se, alla scadenza, il sottostante resta <strong>tra i due strike venduti</strong>. È la somma di un Bull Put Spread e di un Bear Call Spread.",
+        build: ["Vendi una put sotto il prezzo (delta ≈ 0,20) e compri una put ancora più bassa come protezione.",
+                "Vendi una call sopra il prezzo (delta ≈ 0,20) e compri una call ancora più alta come protezione.",
+                "Le opzioni comprate (le \"ali\") fissano la perdita massima: senza di loro il rischio sarebbe illimitato."],
+        wins: ["Il prezzo resta in un intervallo.", "Passa il tempo: ogni giorno le opzioni vendute perdono valore (theta a tuo favore).",
+               "La volatilità implicita scende: le opzioni vendute si sgonfiano."],
+        loses: ["Movimento forte in una delle due direzioni, fino a superare uno strike venduto.",
+                "Aumento della volatilità implicita, anche senza movimento del prezzo (perdita temporanea)."],
+        why: "Il trend è laterale (ADX basso) e la volatilità implicita è alta rispetto alla sua storia: le opzioni sono \"care\" e il bot le vende, aspettandosi che il prezzo resti fermo e la volatilità rientri.",
+        risks: ["La perdita massima è molto più grande del guadagno massimo: si vince spesso poco, si perde raramente molto.",
+                "Un gap (apertura molto diversa dalla chiusura, ad esempio dopo dati macro o trimestrali) può portare subito alla perdita massima.",
+                "Assegnazione anticipata: se un'opzione venduta va molto in the money, la controparte può esercitarla prima della scadenza.",
+                "Quattro gambe significano il doppio dei costi di bid/ask rispetto a uno spread semplice."],
+      },
+      BULL_PUT_SPREAD: {
+        kind: "credit", view: "Rialzista / neutrale", vol: "Volatilità alta",
+        what: "Vendi una put sotto il prezzo attuale e ne compri una con strike più basso come protezione. Incassi un credito subito e lo tieni se il sottostante <strong>resta sopra lo strike venduto</strong>.",
+        build: ["Vendi una put con delta ≈ 0,30 (circa 70% di probabilità teorica di scadere senza valore).",
+                "Compri una put ~5 $ più in basso: limita la perdita massima alla differenza tra gli strike meno il credito."],
+        wins: ["Il prezzo sale, resta fermo o scende di poco.", "Passa il tempo (theta a favore).", "La volatilità implicita scende."],
+        loses: ["Il prezzo scende sotto lo strike venduto.", "La volatilità sale bruscamente (tipico dei ribassi)."],
+        why: "Trend rialzista e volatilità implicita alta: vendere put \"care\" sotto il prezzo è un modo per guadagnare se il rialzo continua o se il prezzo semplicemente non scende.",
+        risks: ["Ribassi improvvisi o gap: i mercati scendono più velocemente di quanto salgano.",
+                "Perdita massima più grande del guadagno massimo.",
+                "Assegnazione anticipata della put venduta se va molto in the money."],
+      },
+      BEAR_CALL_SPREAD: {
+        kind: "credit", view: "Ribassista / neutrale", vol: "Volatilità alta",
+        what: "Vendi una call sopra il prezzo attuale e ne compri una con strike più alto come protezione. Incassi un credito e lo tieni se il sottostante <strong>resta sotto lo strike venduto</strong>.",
+        build: ["Vendi una call con delta ≈ 0,30.", "Compri una call ~5 $ più in alto: fissa la perdita massima."],
+        wins: ["Il prezzo scende, resta fermo o sale di poco.", "Passa il tempo (theta a favore).", "La volatilità implicita scende."],
+        loses: ["Il prezzo sale sopra lo strike venduto (ad esempio un rally improvviso, come NVDA il 23/11).", "La volatilità sale."],
+        why: "Trend ribassista e volatilità implicita alta: si vendono call \"care\" sopra il prezzo, guadagnando se il ribasso continua o se il prezzo non sale.",
+        risks: ["Rally improvvisi (notizie, short squeeze) possono superare lo strike venduto in poche ore.",
+                "Perdita massima più grande del guadagno massimo.",
+                "Assegnazione anticipata della call venduta, più probabile poco prima dello stacco di un dividendo."],
+      },
+      BULL_CALL_SPREAD: {
+        kind: "debit", view: "Rialzista", vol: "Volatilità bassa",
+        what: "Compri una call vicina al prezzo attuale e ne vendi una con strike più alto per ridurre il costo. Paghi un debito: guadagni se il sottostante <strong>sale abbastanza</strong> entro la scadenza.",
+        build: ["Compri una call con delta ≈ 0,60 (leggermente in the money).",
+                "Vendi una call ~5 $ più in alto: abbassa il costo ma limita il guadagno massimo."],
+        wins: ["Il prezzo sale, idealmente fino allo strike venduto o oltre.", "La volatilità sale (effetto modesto su uno spread)."],
+        loses: ["Il prezzo scende o resta fermo: il tempo gioca contro (theta negativo).", "La volatilità implicita scende."],
+        why: "Trend rialzista e volatilità implicita bassa: le opzioni sono \"economiche\", quindi conviene comprarle invece di venderle.",
+        risks: ["Se il movimento non arriva in tempo, l'opzione perde valore ogni giorno.",
+                "La perdita massima è tutto il debito pagato.",
+                "Guadagno limitato: oltre lo strike venduto non si guadagna di più."],
+      },
+      BEAR_PUT_SPREAD: {
+        kind: "debit", view: "Ribassista", vol: "Volatilità bassa",
+        what: "Compri una put vicina al prezzo attuale e ne vendi una con strike più basso per ridurre il costo. Paghi un debito: guadagni se il sottostante <strong>scende abbastanza</strong> entro la scadenza.",
+        build: ["Compri una put con delta ≈ 0,60 (leggermente in the money).",
+                "Vendi una put ~5 $ più in basso: abbassa il costo ma limita il guadagno massimo."],
+        wins: ["Il prezzo scende, idealmente fino allo strike venduto o sotto.", "La volatilità sale (tipico dei ribassi)."],
+        loses: ["Il prezzo sale o resta fermo: il tempo gioca contro (theta negativo).", "La volatilità implicita scende."],
+        why: "Trend ribassista e volatilità implicita bassa: si comprano put \"economiche\" per guadagnare dal ribasso con un rischio limitato al debito pagato.",
+        risks: ["Se il ribasso non arriva in tempo, la posizione perde valore ogni giorno.",
+                "La perdita massima è tutto il debito pagato.",
+                "Con il feed dati gratuito le quote sono approssimative: pagare troppo all'ingresso peggiora molto il rapporto rischio/rendimento (vedi GLD e NVDA del 23/11)."],
+      },
+      LONG_CALL: {
+        kind: "debit", view: "Rialzista", vol: "Volatilità bassa",
+        what: "Compri una sola call. Paghi un premio e guadagni se il sottostante <strong>sale oltre lo strike più il premio</strong>. Il guadagno potenziale non ha limite.",
+        build: ["Compri una call con delta ≈ 0,60."],
+        wins: ["Il prezzo sale con decisione.", "La volatilità sale."],
+        loses: ["Il prezzo scende o resta fermo.", "Passa il tempo (theta negativo, più forte che negli spread).", "La volatilità scende."],
+        why: "Trend rialzista con volatilità bassa e PREFER_SINGLE_LEG_DEBIT attivo: si compra l'opzione singola invece dello spread.",
+        risks: ["Si può perdere tutto il premio pagato.", "Il decadimento temporale è più rapido che negli spread.", "Molto sensibile ai cali di volatilità."],
+      },
+      LONG_PUT: {
+        kind: "debit", view: "Ribassista", vol: "Volatilità bassa",
+        what: "Compri una sola put. Paghi un premio e guadagni se il sottostante <strong>scende sotto lo strike meno il premio</strong>.",
+        build: ["Compri una put con delta ≈ 0,60."],
+        wins: ["Il prezzo scende con decisione.", "La volatilità sale."],
+        loses: ["Il prezzo sale o resta fermo.", "Passa il tempo (theta negativo).", "La volatilità scende."],
+        why: "Trend ribassista con volatilità bassa e PREFER_SINGLE_LEG_DEBIT attivo: si compra l'opzione singola invece dello spread.",
+        risks: ["Si può perdere tutto il premio pagato.", "Il decadimento temporale è più rapido che negli spread.", "Molto sensibile ai cali di volatilità."],
+      },
+    };
+
+    const COMMON_RISKS = [
+      "Conto paper: i prezzi di esecuzione sono simulati e possono differire da quelli di un conto reale.",
+      "Dati gratuiti (feed \"indicative\"): le quote delle opzioni sono approssimative, quindi anche le decisioni del bot lo sono.",
+      "Lo stop loss non è garantito: con un gap o quote larghe l'uscita può avvenire a un prezzo peggiore della soglia.",
+      "Commissioni e fee non sono incluse nei calcoli.",
+    ];
+
+    const pctTxt = (v) => `${Math.round(v * 100)}%`;
+    const usdSigned = (v) => (v >= 0 ? "+" : "−") + usd.format(Math.abs(v));
+
+    function infoButton(strategy, tradeId) {
+      if (!STRATEGY_INFO[strategy]) return "";
+      const attr = tradeId !== undefined ? `data-info-trade="${esc(tradeId)}"` : `data-info-strategy="${esc(strategy)}"`;
+      return `<button type="button" class="info-btn" ${attr} aria-label="Spiegazione della strategia ${esc(prettyStrategy(strategy))}" title="Come funziona questa strategia">i</button>`;
+    }
+
+    // Profitto/perdita per azione a scadenza, al variare del prezzo del sottostante
+    function payoffCurve(legs, entry) {
+      const strikes = legs.map((l) => Number(l.strike));
+      const minK = Math.min(...strikes), maxK = Math.max(...strikes);
+      const span = Math.max(maxK - minK, Math.abs(entry) * 4, minK * 0.03, 2);
+      const lo = Math.max(0, minK - span), hi = maxK + span, n = 240, pts = [];
+      for (let i = 0; i <= n; i++) {
+        const S = lo + ((hi - lo) * i) / n;
+        let v = -entry;
+        for (const l of legs) {
+          const k = Number(l.strike), intr = l.type === "call" ? Math.max(0, S - k) : Math.max(0, k - S);
+          v += (l.side === "buy" ? 1 : -1) * Number(l.ratio || 1) * intr;
+        }
+        pts.push([S, v]);
+      }
+      const breakevens = [];
+      for (let i = 1; i < pts.length; i++) {
+        const [s0, v0] = pts[i - 1], [s1, v1] = pts[i];
+        if ((v0 < 0 && v1 >= 0) || (v0 >= 0 && v1 < 0)) breakevens.push(s0 + ((0 - v0) * (s1 - s0)) / (v1 - v0));
+      }
+      const vals = pts.map((p) => p[1]);
+      const unlimited = pts.at(-1)[1] - pts.at(-2)[1] > 1e-9;  // call comprata senza copertura
+      return { pts, lo, hi, strikes: [...new Set(strikes)].sort((a, b) => a - b), breakevens,
+               maxProfit: Math.max(...vals), maxLoss: Math.min(...vals), unlimited };
+    }
+
+    function payoffSvg(curve, mult) {
+      const W = 680, H = 222, L = 64, R = 12, T = 16, B = 42;
+      const ymax = Math.max(curve.maxProfit, 0.01), ymin = Math.min(curve.maxLoss, -0.01), pad = (ymax - ymin) * 0.12;
+      const x = (S) => L + ((S - curve.lo) / (curve.hi - curve.lo)) * (W - L - R);
+      const y = (v) => T + ((ymax + pad - v) / (ymax - ymin + 2 * pad)) * (H - T - B);
+      const line = curve.pts.map(([S, v]) => `${x(S).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+      const area = `${x(curve.lo).toFixed(1)},${y(0).toFixed(1)} ${line} ${x(curve.hi).toFixed(1)},${y(0).toFixed(1)}`;
+      const y0 = y(0);
+      // Etichette degli strike: se due strike sono troppo vicini, la seconda etichetta va su una riga più in basso
+      let lastX = -Infinity, row = 0;
+      const strikeTicks = curve.strikes.map((k) => {
+        const xk = x(k);
+        row = xk - lastX < 44 ? (row + 1) % 2 : 0;
+        lastX = xk;
+        return `<line x1="${xk}" x2="${xk}" y1="${H - B}" y2="${H - B + 4 + row * 12}" stroke="var(--muted)"/>` +
+          `<text x="${xk}" y="${H - B + 16 + row * 12}" text-anchor="middle" font-size="11" fill="var(--muted)">${num2.format(k)}</text>`;
+      }).join("");
+      const beMarks = curve.breakevens.map((b) => `<line x1="${x(b)}" x2="${x(b)}" y1="${T}" y2="${H - B}" stroke="var(--muted)" stroke-dasharray="3 3"/>` +
+        `<text x="${x(b) + 4}" y="${T + 10}" font-size="11" fill="var(--text-2)">pareggio ${num2.format(b)}</text>`).join("");
+      return `<svg class="payoff" viewBox="0 0 ${W} ${H}" role="img" aria-label="Grafico del profitto o perdita a scadenza in funzione del prezzo del sottostante">
+        <defs>
+          <clipPath id="pfUp"><rect x="0" y="0" width="${W}" height="${y0}"/></clipPath>
+          <clipPath id="pfDn"><rect x="0" y="${y0}" width="${W}" height="${H - y0}"/></clipPath>
+        </defs>
+        <polygon points="${area}" fill="var(--good)" fill-opacity="0.16" clip-path="url(#pfUp)"/>
+        <polygon points="${area}" fill="var(--bad)" fill-opacity="0.16" clip-path="url(#pfDn)"/>
+        <line x1="${L}" x2="${W - R}" y1="${y0}" y2="${y0}" stroke="var(--muted)" stroke-width="1"/>
+        ${beMarks}
+        <polyline points="${line}" fill="none" stroke="var(--series)" stroke-width="2" stroke-linejoin="round"/>
+        <text x="${L - 6}" y="${y(curve.maxProfit) + 4}" text-anchor="end" font-size="11" fill="var(--good)">${curve.unlimited ? "illimitato" : usdSigned(curve.maxProfit * mult)}</text>
+        <text x="${L - 6}" y="${y0 + 4}" text-anchor="end" font-size="11" fill="var(--muted)">0 $</text>
+        <text x="${L - 6}" y="${y(curve.maxLoss) + 4}" text-anchor="end" font-size="11" fill="var(--bad)">${usdSigned(curve.maxLoss * mult)}</text>
+        ${strikeTicks}
+        <text x="${W - R}" y="${H - 2}" text-anchor="end" font-size="11" fill="var(--muted)">prezzo del sottostante alla scadenza →</text>
+      </svg>`;
+    }
+
+    const section = (title, html) => `<h3>${title}</h3>${html}`;
+    const bullets = (items) => `<ul>${items.map((i) => `<li>${i}</li>`).join("")}</ul>`;
+
+    function exitRulesHtml(info, t) {
+      const r = { ...EXIT_DEFAULTS, ...(t?.legs_json?.exit_rules || {}) };
+      const credit = info.kind === "credit";
+      const tp = credit ? r.tp_credit : r.tp_debit, sl = credit ? r.sl_credit : r.sl_debit;
+      const out = [];
+      if (t) {
+        const entry = Number(t.entry_price), base = Math.abs(entry), mult = 100 * Number(t.qty || 1);
+        if (credit) {
+          out.push(`<div class="rule"><strong>Take profit</strong>: quando riacquistare la posizione costa <strong>${num2.format(base * (1 - tp))}</strong> o meno, cioè hai guadagnato il ${pctTxt(tp)} del credito incassato → <span class="good">${usdSigned(base * tp * mult)}</span>.</div>`);
+          out.push(`<div class="rule"><strong>Stop loss</strong>: quando riacquistarla costa <strong>${num2.format(base * (1 + sl))}</strong> o più, cioè la perdita è il ${pctTxt(sl)} del credito → <span class="bad">${usdSigned(-base * sl * mult)}</span>. Scatta solo se la condizione si ripete per ${r.sl_confirm} controlli di fila (circa ${r.sl_confirm} minuti).</div>`);
+        } else {
+          out.push(`<div class="rule"><strong>Take profit</strong>: quando la posizione vale <strong>${num2.format(base * (1 + tp))}</strong> o più, cioè +${pctTxt(tp)} del debito pagato → <span class="good">${usdSigned(base * tp * mult)}</span>.</div>`);
+          out.push(`<div class="rule"><strong>Stop loss</strong>: quando la posizione vale <strong>${num2.format(base * (1 - sl))}</strong> o meno, cioè −${pctTxt(sl)} del debito → <span class="bad">${usdSigned(-base * sl * mult)}</span>. Scatta solo se la condizione si ripete per ${r.sl_confirm} controlli di fila (circa ${r.sl_confirm} minuti).</div>`);
+        }
+        const exp = t.legs_json?.expiration;
+        if (exp) {
+          const [yy, mm, dd] = exp.split("-").map(Number);
+          const closeDay = new Date(Date.UTC(yy, mm - 1, dd - r.close_dte, 12));
+          out.push(`<div class="rule"><strong>Scadenza vicina</strong>: dal <strong>${dayFmt.format(closeDay)}</strong> (${r.close_dte} giorni prima della scadenza del ${dayFmt.format(new Date(Date.UTC(yy, mm - 1, dd, 12)))}) chiude comunque, anche in perdita, per evitare l'assegnazione e i movimenti bruschi degli ultimi giorni.</div>`);
+        }
+        if (!t.legs_json?.exit_rules) out.push(`<p class="muted text-xs mt-2">Soglie di default del bot: questo trade è stato aperto prima che il bot salvasse le soglie effettive. Se le hai cambiate nelle Variables di GitHub, valgono quelle.</p>`);
+      } else {
+        out.push(bullets(credit
+          ? [`<strong>Take profit</strong> al +${pctTxt(r.tp_credit)} del credito incassato.`,
+             `<strong>Stop loss</strong> quando la perdita arriva al ${pctTxt(r.sl_credit)} del credito (confermato per ${r.sl_confirm} controlli).`,
+             `<strong>Scadenza vicina</strong>: chiusura a ${r.close_dte} giorni dalla scadenza.`]
+          : [`<strong>Take profit</strong> al +${pctTxt(r.tp_debit)} del debito pagato.`,
+             `<strong>Stop loss</strong> al −${pctTxt(r.sl_debit)} del debito (confermato per ${r.sl_confirm} controlli).`,
+             `<strong>Scadenza vicina</strong>: chiusura a ${r.close_dte} giorni dalla scadenza.`]));
+      }
+      out.push(`<p class="muted text-xs mt-2">Il bot controlla le posizioni ogni minuto. Non decide nei primi ${r.pause_after_open_min} minuti dopo l'apertura, ` +
+               `usa un tetto di prezzo per le chiusure e, se le quote sono troppo larghe, rimanda la decisione al controllo successivo.</p>`);
+      return out.join("");
+    }
+
+    function tradeNumbersHtml(info, t) {
+      const legs = t.legs_json?.legs || [];
+      if (!legs.length) return "";
+      const entry = Number(t.entry_price), qty = Number(t.qty || 1), mult = 100 * qty;
+      const curve = payoffCurve(legs, entry);
+      const pnlNow = t.status === "OPEN" ? t.unrealized_pnl : t.pnl;
+      const legsTxt = legs.map((l) => `${l.side === "buy" ? "Compri" : "Vendi"} ${l.type === "call" ? "call" : "put"} ${num2.format(Number(l.strike))}`).join(" · ");
+      const rows = [
+        ["Gambe", esc(legsTxt) + (t.legs_json?.expiration ? ` · scadenza ${esc(t.legs_json.expiration)}` : "")],
+        ["Entrata", `${netPriceText(entry)} × 100 × ${qty} = ${entry < 0 ? `<span class="good">${usd.format(Math.abs(entry) * mult)} incassati</span>` : `${usd.format(Math.abs(entry) * mult)} pagati`}`],
+        ["Guadagno massimo", curve.unlimited ? "illimitato" : `<span class="good">${usdSigned(curve.maxProfit * mult)}</span>`],
+        ["Perdita massima", `<span class="bad">${usdSigned(curve.maxLoss * mult)}</span>`],
+        ["Pareggio a scadenza", curve.breakevens.length ? curve.breakevens.map((b) => `${num2.format(b)} $`).join(" e ") : "–"],
+      ];
+      if (pnlNow !== null && pnlNow !== undefined) rows.push([t.status === "OPEN" ? "P&L attuale" : "P&L realizzato",
+        `<span class="${cls(Number(pnlNow))}">${usdSigned(Number(pnlNow))}</span>${t.status === "OPEN" ? ' <span class="muted">non realizzato</span>' : ""}`]);
+      return section(`Questo trade: ${esc(t.ticker)}`,
+        `<dl class="kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>` +
+        `<p class="muted text-xs mt-3">Profitto o perdita alla scadenza, in base al prezzo di ${esc(t.ticker)} (zona verde = guadagno, rossa = perdita):</p>` +
+        payoffSvg(curve, mult));
+    }
+
+    function openStrategyInfo(strategy, trade) {
+      const info = STRATEGY_INFO[strategy];
+      if (!info) return;
+      $("stratTitle").textContent = prettyStrategy(strategy) + (trade ? ` · ${trade.ticker}` : "");
+      $("stratTags").innerHTML = [info.kind === "credit" ? "A credito: incassi subito" : "A debito: paghi subito", info.view, info.vol]
+        .map((x) => `<span class="tag">${esc(x)}</span>`).join("");
+      $("stratBody").innerHTML = [
+        `<p class="mt-3">${info.what}</p>`,
+        trade ? tradeNumbersHtml(info, trade) : "",
+        section("Come è costruita", bullets(info.build)),
+        section("Quando guadagna", bullets(info.wins)),
+        section("Quando perde", bullets(info.loses)),
+        section("Perché il bot la sceglie", `<p>${info.why}</p>` +
+          (trade?.legs_json?.rationale ? `<p class="muted text-xs mt-1">Regime rilevato all'apertura: ${esc(trade.legs_json.rationale)}</p>` : "")),
+        section("Quando la chiude il bot", exitRulesHtml(info, trade)),
+        section("Rischi", bullets([...info.risks, ...COMMON_RISKS])),
+        `<p class="muted text-xs mt-4">Contenuto a scopo didattico, non è un consiglio finanziario.</p>`,
+      ].join("");
+      const dlg = $("stratDialog");
+      if (typeof dlg.showModal === "function") dlg.showModal(); else dlg.setAttribute("open", "");
+      $("stratBody").scrollTop = 0;
+    }
+
+    document.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-info-trade],[data-info-strategy]");
+      if (!btn) return;
+      if (btn.dataset.infoTrade !== undefined) {
+        const trade = state.trades.find((t) => String(t.id) === btn.dataset.infoTrade);
+        if (trade) openStrategyInfo(trade.strategy, trade);
+      } else {
+        openStrategyInfo(btn.dataset.infoStrategy, null);
+      }
+    });
+    $("stratClose").addEventListener("click", () => $("stratDialog").close());
+    $("stratDialog").addEventListener("click", (e) => { if (e.target === e.currentTarget) e.currentTarget.close(); });  // clic fuori = chiudi
 
     // ------------------------------------------------------------------ //
     // Render: screening
@@ -708,7 +1006,7 @@
           <td class="r num">${r.avg_spread_pct !== null ? num2.format(r.avg_spread_pct * 100) + "%" : "–"}</td>
           <td class="num"><span class="scorebar" aria-hidden="true"><span style="width:${Math.min(100, Math.max(0, score))}%"></span></span> ${num2.format(score)}</td>
           <td>${r.selected ? '<span class="pill sel">✓ Sì</span>' : '<span class="muted">No</span>'}</td>
-          <td class="t2"><div>${esc(prettyStrategy(r.strategy) || "–")}</div><div class="muted text-xs">${esc(r.reason || "")}</div></td>
+          <td class="t2"><div class="flex items-center gap-1.5">${esc(prettyStrategy(r.strategy) || "–")}${infoButton(r.strategy)}</div><div class="muted text-xs">${esc(r.reason || "")}</div></td>
         </tr>`;
       }).join("");
     }

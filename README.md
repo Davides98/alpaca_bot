@@ -273,6 +273,7 @@ La dashboard mostra:
 - il **bot**: in sessione, in attesa o fermo, con il contatore al prossimo ciclo di trading, l'ora di fine della sessione e il tempo rimanente, la cadenza dello scheduler (ogni 5 minuti) e gli intervalli della sessione (`REFRESH_INTERVAL_SEC`, `TRADE_INTERVAL_MIN`, `SESSION_MAX_MINUTES`);
 - le posizioni aperte (con P&L non realizzato) e lo storico dei trade. Per ogni trade ci sono il **costo** (premio pagato o incassato = prezzo netto × 100 × contratti, più il costo di chiusura per i trade chiusi) e il **rischio massimo** in $ e in % del capitale. Le eventuali commissioni non sono incluse;
 - l'ultimo screening, con il motivo per cui ogni ticker è stato scelto o scartato.
+- una **scheda didattica** per ogni strategia (pulsante **i** accanto al nome): cos'è e come è costruita, quando guadagna e quando perde, perché il bot l'ha scelta, quando la chiude (con i prezzi esatti di take profit, stop loss e la data di uscita per scadenza), i rischi e il grafico del profitto a scadenza con i punti di pareggio.
 
 Si aggiorna in tempo reale tramite Supabase Realtime, con un fallback di polling ogni 30 secondi.
 

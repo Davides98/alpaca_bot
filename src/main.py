@@ -115,6 +115,19 @@ def plan_to_trade_row(
     }
 
 
+def exit_rules(settings: Settings) -> dict[str, Any]:
+    """Soglie di uscita in vigore all'apertura del trade (la dashboard le mostra nella scheda della strategia)."""
+    return {
+        "tp_credit": settings.TAKE_PROFIT_CREDIT_PCT,
+        "sl_credit": settings.STOP_LOSS_CREDIT_PCT,
+        "tp_debit": settings.TAKE_PROFIT_DEBIT_PCT,
+        "sl_debit": settings.STOP_LOSS_DEBIT_PCT,
+        "close_dte": settings.CLOSE_DTE_THRESHOLD,
+        "sl_confirm": settings.STOP_LOSS_CONFIRM_CHECKS,
+        "pause_after_open_min": settings.NO_TRADE_AFTER_OPEN_MIN,
+    }
+
+
 # ---------------------------------------------------------------------- #
 # Main
 # ---------------------------------------------------------------------- #
@@ -375,8 +388,9 @@ def trading_cycle(
                 cand.row.reason += f" (DRY_RUN, non inviato: {result.message})"
             elif result.filled_qty > 0 and result.fill_net_price is not None:
                 filled += 1
-                storage.insert_trade(plan_to_trade_row(plan, result.fill_net_price, result.filled_qty, result.order_id,
-                                                       result.leg_fills))
+                row = plan_to_trade_row(plan, result.fill_net_price, result.filled_qty, result.order_id, result.leg_fills)
+                row["legs_json"]["exit_rules"] = exit_rules(settings)  # soglie mostrate nella scheda didattica
+                storage.insert_trade(row)
                 cand.row.reason += f" - ESEGUITO {result.filled_qty} @ {result.fill_net_price:+.2f}"
             else:
                 cand.row.reason += f" - NON eseguito: {result.message}"
