@@ -536,9 +536,13 @@
         const entryTxt = `${num2.format(Math.abs(entry))} <span class="muted">${entry < 0 ? "CR" : "DB"}</span>`;
         const isOpen = t.status === "OPEN";
         const pnl = isOpen ? t.unrealized_pnl : t.pnl;
+        // % sul credito incassato / debito pagato: è il numero che il bot confronta con le soglie TP/SL
+        const basis = Math.abs(entry) * 100 * Number(t.qty || 1);
+        const pnlPct = basis > 0 && pnl !== null && pnl !== undefined ? (Number(pnl) / basis) * 100 : null;
         const pnlTxt = pnl === null || pnl === undefined
           ? `<span class="muted">–</span>`
-          : `<span class="${cls(Number(pnl))}">${arrow(Number(pnl))}${fmtUsd(Number(pnl))}</span>${isOpen ? ' <span class="muted text-xs">non real.</span>' : ""}`;
+          : `<div><span class="${cls(Number(pnl))}">${arrow(Number(pnl))}${fmtUsd(Number(pnl))}</span></div>` +
+            `<div class="muted text-xs">${pnlPct !== null ? `${fmtPct(pnlPct)} del ${entry < 0 ? "credito" : "debito"}` : ""}${isOpen ? " · non real." : ""}</div>`;
         const legs = (t.legs_json?.legs || []).map((l) => `${l.side === "buy" ? "+" : "−"}${l.type === "call" ? "C" : "P"}${l.strike}`).join(" ");
         return `<tr>
           <td class="num">${dtFmt.format(new Date(t.created_at))}</td>

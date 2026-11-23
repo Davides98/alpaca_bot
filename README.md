@@ -199,7 +199,7 @@ TLT    | SIDEWAYS | LOW_IV  |    21 |  14.2 |    2.8% |    0.0 | no  | NO_TRADE 
 5. **Schedulazione in modalità sessione:** i cron di GitHub sono inaffidabili (ritardi anche di ore, slot saltati), quindi il bot non dipende da un cron frequente. Il cron `17 13-20 * * 1-5` parte una volta all'ora e avvia una **sessione continua** che resta attiva fino alla chiusura di Wall Street:
    - **ogni 60 secondi** (`REFRESH_INTERVAL_SEC`): snapshot dell'equity, P&L delle posizioni e controllo di take profit, stop loss e DTE;
    - **ogni 10 minuti** (`TRADE_INTERVAL_MIN`): ciclo completo di screening e nuovi trade;
-   - se l'apertura è vicina (meno di 65 minuti), la sessione la aspetta; festivi e orari esatti li decide `get_clock()`;
+   - se l'apertura è vicina (meno di 20 minuti), la sessione la aspetta; festivi e orari esatti li decide `get_clock()`;
    - un job GitHub dura al massimo 6 ore, mentre la sessione USA ne dura 6,5. La sessione si chiude quindi da sola dopo 340 minuti e il run orario successivo, già in coda, riprende fino alla chiusura.
 
    I **run manuali** eseguono un solo ciclo, salvo che tu spunti `session`.
@@ -211,6 +211,35 @@ Note su GitHub Actions:
 - GitHub **disattiva i workflow schedulati** dei repository pubblici dopo 60 giorni senza attività (commit). Basta riattivarli dalla tab Actions.
 
 ---
+
+## 3b. Scheduler Supabase (consigliato: avvio affidabile e gratuito)
+
+Il cron di GitHub ritarda o salta spesso i run: è capitato che in un'intera giornata di mercato non partisse nessuno slot. Lo scheduler su Supabase risolve il problema. Ogni 5 minuti, dal lunedì al venerdì, un job dentro il database controlla se il bot ha dato segni di vita negli ultimi 12 minuti; se non li ha dati, avvia il workflow tramite l'API di GitHub. Durante una sessione il bot scrive uno snapshot al minuto, quindi lo scheduler non fa nulla. Se la sessione si interrompe, la riavvia entro pochi minuti.
+
+È tutto gratuito: pg_cron, pg_net e Vault sono inclusi nel piano Free di Supabase.
+
+**1. Crea un token GitHub limitato a questo repository**
+1. GitHub → foto profilo → **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**.
+2. **Repository access:** *Only select repositories* → scegli questo repository.
+3. **Permissions → Repository permissions → Actions:** *Read and write*. Non servono altri permessi.
+4. Scegli una scadenza (per esempio 1 anno), genera il token e copialo.
+
+**2. Installa lo scheduler**
+1. Supabase → **SQL Editor → New query**: incolla tutto [`supabase/scheduler.sql`](supabase/scheduler.sql) e premi **Run**.
+2. In una **nuova** query, *non* in un file del repository, salva il token nel Vault cifrato:
+   ```sql
+   select vault.create_secret('IL_TUO_TOKEN', 'github_dispatch_token');
+   ```
+3. Prova subito: `select private.dispatch_bot_if_idle();`. Se il bot è fermo risponde "avvio richiesto" e su GitHub → Actions compare un run.
+
+**Verifiche utili** (in fondo a `scheduler.sql` ci sono le query pronte):
+- `select * from cron.job_run_details order by start_time desc limit 10;` mostra cosa ha deciso lo scheduler a ogni controllo;
+- `select status_code, content from net._http_response order by created desc limit 5;` mostra la risposta di GitHub. `204` significa avviato; `401`, `403` o `404` indicano un token scaduto o senza permessi, oppure un nome del repository sbagliato.
+
+**Quando il token scade** crea un nuovo token e aggiorna il Vault:
+`select vault.update_secret(id, 'NUOVO_TOKEN') from vault.secrets where name = 'github_dispatch_token';`
+
+> Il cron di GitHub resta attivo come riserva. Nei giorni festivi o prima dell'apertura lo scheduler avvia qualche run breve che esce subito con `MARKET_CLOSED`: è normale.
 
 ## 4. Dashboard su GitHub Pages
 
@@ -260,6 +289,18 @@ Vai in **Settings → Secrets and variables → Actions** e crea un **Secret** o
 | `WATCHLIST` | `SPY,QQQ,IWM,TLT,GLD,AAPL,MSFT,NVDA,AMZN,AMD` | ticker da analizzare, separati da virgola |
 | `PREFER_SINGLE_LEG_DEBIT` | `false` | `true` = Long Call/Put invece dei debit spread |
 | `CHASE_TO_NATURAL` | `true` | `false` = chasing a step fissi da 0.01$ invece che fino al prezzo naturale |
+| `TAKE_PROFIT_CREDIT_PCT` | `0.50` | chiude una posizione a credito quando il guadagno arriva a questa % del credito incassato (es. `0.30` o `30%`) |
+| `STOP_LOSS_CREDIT_PCT` | `1.00` | chiude una posizione a credito quando la perdita arriva a questa % del credito |
+| `TAKE_PROFIT_DEBIT_PCT` | `0.40` | chiude una posizione a debito quando il guadagno arriva a questa % del debito pagato |
+| `STOP_LOSS_DEBIT_PCT` | `0.30` | chiude una posizione a debito quando la perdita arriva a questa % del debito |
+| `REFRESH_INTERVAL_SEC` | `60` | ogni quanto, in sessione, aggiorna equity e P&L e controlla le soglie (da 30 a 600 s) |
+| `TRADE_INTERVAL_MIN` | `10` | ogni quanto, in sessione, fa screening e nuovi trade |
+
+**Esempio: soglie di uscita.** Le soglie valgono per **ogni singola posizione**, in percentuale del credito incassato o del debito pagato. Con un credito di 625 $:
+- `TAKE_PROFIT_CREDIT_PCT=0.50` (default) chiude a **+312,50 $**;
+- `TAKE_PROFIT_CREDIT_PCT=30%` chiude a **+187,50 $**.
+
+Nella dashboard, sotto il P&L di ogni posizione, vedi la stessa percentuale che il bot confronta con la soglia (es. "+31% del credito"). La regola di uscita a DTE ≤ 7 resta sempre attiva.
 
 > 💡 Per questi valori conviene la tab **Variables**: puoi rileggerli e modificarli quando vuoi. I **Secrets** invece non si possono rileggere, e GitHub nasconde il loro valore (`***`) ovunque compaia nei log: un secret `2` può oscurare ogni "2" del log.
 

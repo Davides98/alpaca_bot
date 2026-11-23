@@ -75,7 +75,7 @@ class SupabaseStorage:
             "status": status,
             "message": message[:500],
             "dry_run": dry_run,
-            "trigger": os.getenv("GITHUB_EVENT_NAME", "local"),
+            "trigger": os.getenv("BOT_TRIGGER") or os.getenv("GITHUB_EVENT_NAME", "local"),
         }
         if self._safe("bot_runs.insert", lambda: self.client.table("bot_runs").insert(row).execute(), None):
             logger.debug("Run {} registrato su bot_runs ({})", run_id, status)

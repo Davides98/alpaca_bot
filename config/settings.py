@@ -49,7 +49,9 @@ class Settings(BaseSettings):
     REFRESH_INTERVAL_SEC: int = Field(default=60, ge=30, le=600)  # equity + P&L + TP/SL
     TRADE_INTERVAL_MIN: int = Field(default=10, ge=1, le=120)  # screening + nuovi trade
     SESSION_MAX_MINUTES: int = Field(default=340, ge=5, le=350)  # i job GitHub durano al massimo 360 min
-    SESSION_WAIT_FOR_OPEN_MIN: int = Field(default=65, ge=0, le=120)  # se l'apertura è vicina, la aspetta
+    # Se l'apertura è vicina la aspetta. Breve di proposito: lo scheduler Supabase riavvia il bot ogni pochi
+    # minuti, quindi è meglio uscire e ripartire che restare fermi a lungo senza dare segni di vita.
+    SESSION_WAIT_FOR_OPEN_MIN: int = Field(default=20, ge=0, le=120)
 
     # ------------------------------------------------------------------ #
     # Universo e dati
@@ -103,10 +105,12 @@ class Settings(BaseSettings):
     MAX_RISK_PER_TRADE_PCT: float = 0.02
     MAX_OPEN_POSITIONS: int = Field(default=3, ge=1, le=20)
     MAX_NEW_TRADES_PER_RUN: int = Field(default=1, ge=1, le=10)
-    TAKE_PROFIT_CREDIT_PCT: float = 0.50  # +50% del credito massimo
-    STOP_LOSS_CREDIT_PCT: float = 1.00  # -100% del credito incassato
-    TAKE_PROFIT_DEBIT_PCT: float = 0.40  # +40% del debito pagato
-    STOP_LOSS_DEBIT_PCT: float = 0.30  # -30% del debito pagato
+    # Soglie di uscita per OGNI posizione, in frazione del credito incassato / debito pagato.
+    # Accettano sia 0.30 sia "30%". Esempio: credito incassato 625$, TAKE_PROFIT_CREDIT_PCT=0.30 -> chiude a +187.50$.
+    TAKE_PROFIT_CREDIT_PCT: float = Field(default=0.50, gt=0, le=1.0)  # +50% del credito (il massimo teorico è 100%)
+    STOP_LOSS_CREDIT_PCT: float = Field(default=1.00, gt=0, le=5.0)  # -100% del credito incassato
+    TAKE_PROFIT_DEBIT_PCT: float = Field(default=0.40, gt=0, le=10.0)  # +40% del debito pagato
+    STOP_LOSS_DEBIT_PCT: float = Field(default=0.30, gt=0, le=1.0)  # -30% del debito pagato (il massimo è 100%)
 
     # ------------------------------------------------------------------ #
     # Esecuzione
@@ -137,6 +141,17 @@ class Settings(BaseSettings):
             return [s.strip().strip("'\"").upper() for s in cleaned.split(",") if s.strip().strip("'\"")]
         if isinstance(value, (list, tuple)):
             return [str(s).strip().upper() for s in value if str(s).strip()]
+        return value
+
+    @field_validator(
+        "TAKE_PROFIT_CREDIT_PCT", "STOP_LOSS_CREDIT_PCT", "TAKE_PROFIT_DEBIT_PCT", "STOP_LOSS_DEBIT_PCT",
+        "MAX_RISK_PER_TRADE_PCT", mode="before",
+    )
+    @classmethod
+    def _parse_percent(cls, value: Any) -> Any:
+        """Accetta '30%' come 0.30 (oltre al formato decimale 0.30)."""
+        if isinstance(value, str) and value.strip().endswith("%"):
+            return float(value.strip().rstrip("%").replace(",", ".")) / 100.0
         return value
 
     @model_validator(mode="after")

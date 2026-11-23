@@ -432,6 +432,12 @@ def main() -> int:
         settings.MIN_OPPORTUNITY_SCORE, settings.PREFER_SINGLE_LEG_DEBIT, settings.CHASE_TO_NATURAL,
         ",".join(settings.WATCHLIST),
     )
+    logger.info(
+        "Uscite per posizione: credito TP +{:.0%} / SL -{:.0%} del credito | debito TP +{:.0%} / SL -{:.0%} del debito | "
+        "chiusura a DTE <= {}",
+        settings.TAKE_PROFIT_CREDIT_PCT, settings.STOP_LOSS_CREDIT_PCT, settings.TAKE_PROFIT_DEBIT_PCT,
+        settings.STOP_LOSS_DEBIT_PCT, settings.CLOSE_DTE_THRESHOLD,
+    )
     ctx = RunContext(run_id=uuid.uuid4().hex[:12], storage=SupabaseStorage(settings))
     code = 1
     try:

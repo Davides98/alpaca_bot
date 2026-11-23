@@ -244,3 +244,26 @@ def test_price_ladder_classic_mode() -> None:
     from src.execution.executor import price_ladder
 
     assert price_ladder(-1.50, -1.30, attempts=3, min_step=0.01, to_natural=False) == [-1.50, -1.49, -1.48, -1.47]
+
+
+# ---------------------------------------------------------------------- #
+# Soglie di uscita configurabili
+# ---------------------------------------------------------------------- #
+def test_custom_take_profit_closes_earlier() -> None:
+    # NVDA reale: credito 1.25, P&L +0.385/unità (+31%). Con TP 50% resta aperta, con TP 30% si chiude.
+    default = Settings(_env_file=None)
+    custom = Settings(_env_file=None, TAKE_PROFIT_CREDIT_PCT="30%")
+    assert evaluate_exit(-1.25, -0.865, 35, default)[0] is None
+    assert evaluate_exit(-1.25, -0.865, 35, custom)[0] == "TAKE_PROFIT"
+
+
+def test_percent_parsing_and_bounds() -> None:
+    from pydantic import ValidationError
+
+    assert Settings(_env_file=None, TAKE_PROFIT_CREDIT_PCT="30%").TAKE_PROFIT_CREDIT_PCT == pytest.approx(0.30)
+    assert Settings(_env_file=None, TAKE_PROFIT_CREDIT_PCT="0.3").TAKE_PROFIT_CREDIT_PCT == pytest.approx(0.30)
+    assert Settings(_env_file=None, STOP_LOSS_DEBIT_PCT="25%").STOP_LOSS_DEBIT_PCT == pytest.approx(0.25)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, TAKE_PROFIT_CREDIT_PCT="150%")  # oltre il massimo teorico del credito
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, TAKE_PROFIT_CREDIT_PCT="0")
