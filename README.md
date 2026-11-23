@@ -206,7 +206,7 @@ TLT    | SIDEWAYS | LOW_IV  |    21 |  14.2 |    2.8% |    0.0 | no  | NO_TRADE 
 4. **Test manuale:** tab **Actions → Run Options Bot → Run workflow**. Per una prova senza ordini spunta `dry_run` (di default è spento) e premi *Run*. Per provare a mercato chiuso spunta anche `ignore_market_hours`.
 5. **Schedulazione in modalità sessione:** i cron di GitHub sono inaffidabili (ritardi anche di ore, slot saltati), quindi il bot non dipende da un cron frequente. Il cron `17 13-20 * * 1-5` parte una volta all'ora e avvia una **sessione continua** che resta attiva fino alla chiusura di Wall Street:
    - **ogni 60 secondi** (`REFRESH_INTERVAL_SEC`): snapshot dell'equity, P&L delle posizioni e controllo di take profit, stop loss e DTE;
-   - **ogni 10 minuti** (`TRADE_INTERVAL_MIN`): ciclo completo di screening e nuovi trade;
+   - **ogni 5 minuti** (`TRADE_INTERVAL_MIN`): ciclo completo di screening e nuovi trade;
    - se l'apertura è vicina (meno di 20 minuti), la sessione la aspetta; festivi e orari esatti li decide `get_clock()`;
    - un job GitHub dura al massimo 6 ore, mentre la sessione USA ne dura 6,5. La sessione si chiude quindi da sola dopo 340 minuti e il run orario successivo, già in coda, riprende fino alla chiusura.
 
@@ -314,7 +314,7 @@ Vai in **Settings → Secrets and variables → Actions** e crea un **Secret** o
 | `STOP_LOSS_CONFIRM_CHECKS` | `2` | controlli consecutivi necessari per far scattare lo stop loss (in sessione) |
 | `STOP_LOSS_COOLDOWN_HOURS` | `24` | ore di pausa su un ticker dopo uno stop loss (`0` = nessuna pausa) |
 | `REFRESH_INTERVAL_SEC` | `60` | ogni quanto, in sessione, aggiorna equity e P&L e controlla le soglie (da 30 a 600 s) |
-| `TRADE_INTERVAL_MIN` | `10` | ogni quanto, in sessione, fa screening e nuovi trade |
+| `TRADE_INTERVAL_MIN` | `5` | ogni quanto, in sessione, fa screening e nuovi trade |
 
 **Esempio: soglie di uscita.** Le soglie valgono per **ogni singola posizione**, in percentuale del credito incassato o del debito pagato. Con un credito di 625 $:
 - `TAKE_PROFIT_CREDIT_PCT=0.50` (default) chiude a **+312,50 $**;

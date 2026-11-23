@@ -284,7 +284,7 @@
     // Cadenza dello scheduler: deve corrispondere a supabase/scheduler.sql (cron '*/5 13-20 * * 1-5', idle 12 min)
     const SCHED = { everyMin: 5, fromHourUtc: 13, toHourUtc: 20, idleMin: 12 };
     // Valori di default del bot, usati solo finché la tabella bot_status non riporta quelli reali
-    const BOT_DEFAULTS = { refreshSec: 60, tradeMin: 10, sessionMaxMin: 340 };
+    const BOT_DEFAULTS = { refreshSec: 60, tradeMin: 5, sessionMaxMin: 340 };
 
     // ------------------------------------------------------------------ //
     // Formattazione
