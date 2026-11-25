@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     SESSION_MODE: bool = False  # False = run singolo (locale / manuale); True = ciclo continuo (GitHub schedulato)
     REFRESH_INTERVAL_SEC: int = Field(default=60, ge=30, le=600)  # equity + P&L + TP/SL
-    TRADE_INTERVAL_MIN: int = Field(default=5, ge=1, le=120)  # screening + nuovi trade
+    TRADE_INTERVAL_MIN: int = Field(default=1, ge=1, le=120)  # screening + nuovi trade
     SESSION_MAX_MINUTES: int = Field(default=340, ge=5, le=350)  # i job GitHub durano al massimo 360 min
     # Se l'apertura è vicina la aspetta. Breve di proposito: lo scheduler Supabase riavvia il bot ogni pochi
     # minuti, quindi è meglio uscire e ripartire che restare fermi a lungo senza dare segni di vita.

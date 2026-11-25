@@ -204,10 +204,11 @@
         </div>
         <div class="flex flex-wrap items-center gap-2">
           <div class="seg" role="group" aria-label="Intervallo temporale" id="rangeSeg">
+            <button type="button" data-range="-1" aria-pressed="true" title="Ultima giornata di mercato, un punto al minuto">Sessione</button>
             <button type="button" data-range="7">1S</button>
             <button type="button" data-range="30">1M</button>
             <button type="button" data-range="90">3M</button>
-            <button type="button" data-range="0" aria-pressed="true">Tutto</button>
+            <button type="button" data-range="0">Tutto</button>
           </div>
           <div class="seg" role="group" aria-label="Unità" id="unitSeg">
             <button type="button" data-unit="usd" aria-pressed="true">$</button>
@@ -315,7 +316,7 @@
     // Cadenza dello scheduler: deve corrispondere a supabase/scheduler.sql (cron '*/5 13-20 * * 1-5', idle 12 min)
     const SCHED = { everyMin: 5, fromHourUtc: 13, toHourUtc: 20, idleMin: 12 };
     // Valori di default del bot, usati solo finché la tabella bot_status non riporta quelli reali
-    const BOT_DEFAULTS = { refreshSec: 60, tradeMin: 5, sessionMaxMin: 340 };
+    const BOT_DEFAULTS = { refreshSec: 60, tradeMin: 1, sessionMaxMin: 340 };
 
     // ------------------------------------------------------------------ //
     // Formattazione
@@ -350,7 +351,7 @@
     // ------------------------------------------------------------------ //
     // Stato
     // ------------------------------------------------------------------ //
-    const state = { snapshots: [], trades: [], screening: [], unit: "usd", rangeDays: 0, status: "ALL" };
+    const state = { snapshots: [], trades: [], screening: [], unit: "usd", rangeDays: -1, status: "ALL" };
     let chart = null;
     let db = null;
 
@@ -517,6 +518,12 @@
 
     function visibleSnapshots() {
       if (!state.rangeDays) return state.snapshots;
+      if (state.rangeDays === -1) {  // ultima giornata di mercato (stessa data dell'ultimo snapshot)
+        const last = state.snapshots.at(-1);
+        if (!last) return [];
+        const day = last.t.toDateString();
+        return state.snapshots.filter((s) => s.t.toDateString() === day);
+      }
       const cutoff = Date.now() - state.rangeDays * 86_400_000;
       return state.snapshots.filter((s) => s.t.getTime() >= cutoff);
     }

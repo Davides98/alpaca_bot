@@ -25,7 +25,7 @@ on:
   schedule:
     # RISERVA: cron orario di GitHub, nel caso lo scheduler Supabase non sia configurato.
     # Modalità sessione: il run resta attivo fino alla chiusura di Wall Street (aggiorna equity/P&L ogni
-    # minuto, fa trading ogni 5 minuti). Minuto :17 per evitare lo scoccare dell'ora.
+    # minuto, fa trading ogni minuto). Minuto :17 per evitare lo scoccare dell'ora.
     # Festivi e orari esatti li decide TradingClient.get_clock().
     - cron: "17 13-20 * * 1-5"
 
