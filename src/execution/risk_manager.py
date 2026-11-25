@@ -81,6 +81,11 @@ def evaluate_exit(entry_net: float, position_value: float, dte: int, settings: S
     return None, pnl
 
 
+def _px(price: float) -> str:
+    """Prezzo per azione in formato italiano, sempre positivo (es. 4,27)."""
+    return f"{abs(price):.2f}".replace(".", ",")
+
+
 def exit_price_cap(reason: str, entry_net: float, exit_mid: float, base: float, settings: Settings) -> float:
     """
     Netto massimo (con segno, + = pago) accettabile per l'ordine di chiusura.
@@ -290,75 +295,13 @@ class RiskManager:
                     leg.bid, leg.ask = quotes[leg.symbol]
 
         for g in groups:
-            value = g.position_value()
-            label = f"{g.underlying} {g.strategy} {g.expiration}"
-            if value is None:
-                logger.warning("[{}] quote non disponibili, salto la valutazione", label)
-                report.open_groups.append(g)
-                continue
-            reason, pnl_unit = evaluate_exit(g.entry_net, value, g.dte, self.s)
-            pnl_usd = pnl_unit * CONTRACT_MULTIPLIER * g.qty
-            basis = abs(g.entry_net)
-            pnl_pct = pnl_unit / basis if basis else 0.0
-            logger.info(
-                "[{}] x{} | entrata {:+.2f} | valore attuale {:+.2f} | P&L {:+.2f}/unità = ${:+,.0f} ({:+.0%} della base) | DTE {}",
-                label, g.qty, g.entry_net, value, pnl_unit, pnl_usd, pnl_pct, g.dte,
-            )
-            if g.trade and not self.s.DRY_RUN:
-                self.storage.update_trade(g.trade["id"], {"unrealized_pnl": round(pnl_usd, 2), "dte": g.dte})
-
-            key = frozenset(g.symbols)
-            if reason != "STOP_LOSS":
-                self._sl_streak.pop(key, None)
-            if reason is None:
-                logger.info("[{}] nessuna condizione di uscita: mantengo la posizione", label)
-                report.open_groups.append(g)
-                continue
-
-            specs = self.close_specs(g)
-            width = g.width
-            if reason in ("TAKE_PROFIT", "STOP_LOSS") and quotes_too_wide(specs, width, self.s.MAX_QUOTE_WIDTH_PCT_OF_WIDTH):
-                waited = self._wide_streak.get(key, 0) + 1
-                self._wide_streak[key] = waited
-                # Il take profit può aspettare; lo stop loss non all'infinito: dopo MAX_WIDE_QUOTE_POSTPONES
-                # controlli di fila chiude comunque (con il tetto di prezzo che limita la slippage).
-                if reason == "TAKE_PROFIT" or waited < MAX_WIDE_QUOTE_POSTPONES:
-                    logger.warning(
-                        "[{}] {} rilevato ma quote troppo larghe (mid {:+.2f}, naturale {:+.2f}): non mi fido del prezzo, "
-                        "ricontrollo al prossimo ciclo ({}/{})", label, reason, net_mid(specs), net_natural(specs),
-                        waited, MAX_WIDE_QUOTE_POSTPONES,
-                    )
-                    report.open_groups.append(g)
-                    continue
-            else:
-                self._wide_streak.pop(key, None)
-            if reason == "STOP_LOSS":
-                streak = self._sl_streak.get(key, 0) + 1
-                self._sl_streak[key] = streak
-                if streak < self.sl_confirm_checks:
-                    logger.warning("[{}] STOP_LOSS da confermare ({}/{}): ricontrollo al prossimo ciclo",
-                                   label, streak, self.sl_confirm_checks)
-                    report.open_groups.append(g)
-                    continue
-
-            cap = exit_price_cap(reason, g.entry_net, net_mid(specs), slippage_base(specs, width), self.s)
-            logger.warning("[{}] condizione di uscita {} -> chiudo la posizione (tetto prezzo {:+.2f})", label, reason, cap)
-            result = self.close_group(g, label, cap)
-            if result.filled:
-                exit_net = result.fill_net_price if result.fill_net_price is not None else -value
-                realized = -(g.entry_net + exit_net) * CONTRACT_MULTIPLIER * g.qty
-                logger.success("[{}] CHIUSA ({}) P&L realizzato ${:+,.2f}", label, reason, realized)
-                report.closed.append(label)
-                self._sl_streak.pop(key, None)
-                if reason == "STOP_LOSS":
-                    report.cooldown_underlyings.add(g.underlying)
-                if g.trade:
-                    self.storage.close_trade(g.trade["id"], exit_price=round(exit_net, 4), pnl=round(realized, 2), reason=reason,
-                                             legs_json=self._with_exit_fills(g.trade, result.leg_fills))
-            else:
-                if result.dry_run:
-                    report.closed.append(f"{label} (DRY_RUN)")
-                report.open_groups.append(g)
+            state, text, pnl_usd = self._manage_group(g, report)
+            # Ultima decisione salvata sul trade: la dashboard mostra il motivo per cui non chiude
+            if g.trade and not self.s.DRY_RUN and g in report.open_groups:
+                fields: dict[str, Any] = {"dte": g.dte, "legs_json": self._with_exit_status(g.trade, state, text)}
+                if pnl_usd is not None:
+                    fields["unrealized_pnl"] = round(pnl_usd, 2)
+                self.storage.update_trade(g.trade["id"], fields)
 
         report.occupied_underlyings = {g.underlying for g in report.open_groups} | self.pending_order_underlyings()
         report.cooldown_underlyings |= self.cooldown_underlyings()
@@ -367,6 +310,117 @@ class RiskManager:
             report.open_count, self.s.MAX_OPEN_POSITIONS, sorted(report.occupied_underlyings) or "-",
         )
         return report
+
+    @staticmethod
+    def _with_exit_status(trade: dict[str, Any], state: str, text: str) -> dict[str, Any]:
+        legs_json = dict(trade.get("legs_json") or {})
+        legs_json["exit_status"] = {"state": state, "text": text, "at": datetime.now(timezone.utc).isoformat()}
+        trade["legs_json"] = legs_json
+        return legs_json
+
+    def _manage_group(self, g: PositionGroup, report: RiskReport) -> tuple[str, str, float | None]:
+        """Valuta e, se serve, chiude una posizione. Ritorna (stato, spiegazione, P&L non realizzato in $)."""
+        value = g.position_value()
+        label = f"{g.underlying} {g.strategy} {g.expiration}"
+        if value is None:
+            logger.warning("[{}] quote non disponibili, salto la valutazione", label)
+            report.open_groups.append(g)
+            return "NO_QUOTES", "Quote non disponibili in questo controllo: nessuna decisione, riprovo al prossimo.", None
+        reason, pnl_unit = evaluate_exit(g.entry_net, value, g.dte, self.s)
+        pnl_usd = pnl_unit * CONTRACT_MULTIPLIER * g.qty
+        basis = abs(g.entry_net)
+        pnl_pct = pnl_unit / basis if basis else 0.0
+        logger.info(
+            "[{}] x{} | entrata {:+.2f} | valore attuale {:+.2f} | P&L {:+.2f}/unità = ${:+,.0f} ({:+.0%} della base) | DTE {}",
+            label, g.qty, g.entry_net, value, pnl_unit, pnl_usd, pnl_pct, g.dte,
+        )
+
+        credit = g.entry_net < 0
+        specs = self.close_specs(g)
+        width = g.width
+        mid_close, nat_close = net_mid(specs), net_natural(specs)
+        # Prezzo di chiusura detto "a parole": a credito si paga per chiudere, a debito si incassa
+        market_txt = (f"chiudere ora costa {_px(nat_close)} (prezzo medio {_px(mid_close)})" if credit
+                      else f"vendendo ora incassi {_px(-nat_close)} (prezzo medio {_px(-mid_close)})")
+        label_it = {"TAKE_PROFIT": "Take profit", "STOP_LOSS": "Stop loss", "DTE_THRESHOLD": "Uscita per scadenza vicina"}
+
+        key = frozenset(g.symbols)
+        if reason != "STOP_LOSS":
+            self._sl_streak.pop(key, None)
+        if reason is None:
+            logger.info("[{}] nessuna condizione di uscita: mantengo la posizione", label)
+            report.open_groups.append(g)
+            return "HOLD", self._hold_text(g, value), pnl_usd
+
+        if reason in ("TAKE_PROFIT", "STOP_LOSS") and quotes_too_wide(specs, width, self.s.MAX_QUOTE_WIDTH_PCT_OF_WIDTH):
+            waited = self._wide_streak.get(key, 0) + 1
+            self._wide_streak[key] = waited
+            # Il take profit può aspettare; lo stop loss non all'infinito: dopo MAX_WIDE_QUOTE_POSTPONES
+            # controlli di fila chiude comunque (con il tetto di prezzo che limita la slippage).
+            if reason == "TAKE_PROFIT" or waited < MAX_WIDE_QUOTE_POSTPONES:
+                logger.warning(
+                    "[{}] {} rilevato ma quote troppo larghe (mid {:+.2f}, naturale {:+.2f}): non mi fido del prezzo, "
+                    "ricontrollo al prossimo ciclo ({}/{})", label, reason, mid_close, nat_close,
+                    waited, MAX_WIDE_QUOTE_POSTPONES,
+                )
+                report.open_groups.append(g)
+                extra = ("" if reason == "TAKE_PROFIT"
+                         else f" Se resta così, chiude comunque dopo {MAX_WIDE_QUOTE_POSTPONES} controlli ({waited}/{MAX_WIDE_QUOTE_POSTPONES}).")
+                return (f"{reason}_WAIT_WIDE",
+                        f"{label_it[reason]} raggiunto al prezzo medio, ma le quote sono troppo larghe: {market_txt}. "
+                        f"Il bot non si fida e ricontrolla tra un minuto.{extra}", pnl_usd)
+        else:
+            self._wide_streak.pop(key, None)
+        if reason == "STOP_LOSS":
+            streak = self._sl_streak.get(key, 0) + 1
+            self._sl_streak[key] = streak
+            if streak < self.sl_confirm_checks:
+                logger.warning("[{}] STOP_LOSS da confermare ({}/{}): ricontrollo al prossimo ciclo",
+                               label, streak, self.sl_confirm_checks)
+                report.open_groups.append(g)
+                return ("SL_CONFIRM",
+                        f"Stop loss raggiunto, da confermare ({streak}/{self.sl_confirm_checks}): chiude solo se si ripete "
+                        f"al prossimo controllo. Ora {market_txt}.", pnl_usd)
+
+        cap = exit_price_cap(reason, g.entry_net, mid_close, slippage_base(specs, width), self.s)
+        logger.warning("[{}] condizione di uscita {} -> chiudo la posizione (tetto prezzo {:+.2f})", label, reason, cap)
+        result = self.close_group(g, label, cap)
+        if result.filled:
+            exit_net = result.fill_net_price if result.fill_net_price is not None else -value
+            realized = -(g.entry_net + exit_net) * CONTRACT_MULTIPLIER * g.qty
+            logger.success("[{}] CHIUSA ({}) P&L realizzato ${:+,.2f}", label, reason, realized)
+            report.closed.append(label)
+            self._sl_streak.pop(key, None)
+            if reason == "STOP_LOSS":
+                report.cooldown_underlyings.add(g.underlying)
+            if g.trade:
+                self.storage.close_trade(g.trade["id"], exit_price=round(exit_net, 4), pnl=round(realized, 2), reason=reason,
+                                         legs_json=self._with_exit_fills(g.trade, result.leg_fills))
+            return "CLOSED", f"{label_it[reason]}: chiusa.", None
+
+        report.open_groups.append(g)
+        if result.dry_run:
+            report.closed.append(f"{label} (DRY_RUN)")
+            return "DRY_RUN", f"{label_it[reason]} raggiunto: in DRY_RUN l'ordine di chiusura non viene inviato.", pnl_usd
+        if result.status == "rejected":
+            return ("CLOSE_REJECTED",
+                    f"{label_it[reason]} raggiunto, ma Alpaca ha rifiutato l'ordine di chiusura: {result.message}", pnl_usd)
+        tried = result.ladder or [cap]
+        limit_txt = (f"pagando al massimo {_px(max(tried))}" if credit else f"incassando almeno {_px(-max(tried))}")
+        why_cap = " È il prezzo che garantisce il take profit: sotto non vende." if reason == "TAKE_PROFIT" else ""
+        return ("CLOSE_NOT_FILLED",
+                f"{label_it[reason]} raggiunto: ordine di chiusura provato {limit_txt}, ma non eseguito ({market_txt}).{why_cap} "
+                f"Riprova al prossimo controllo.", pnl_usd)
+
+    def _hold_text(self, g: PositionGroup, value: float) -> str:
+        """Spiegazione della posizione mantenuta: dove si trova rispetto alle soglie."""
+        s, base = self.s, abs(g.entry_net)
+        if g.entry_net < 0:  # credito: conta quanto costa ricomprarla
+            cost = -value
+            return (f"Nessuna soglia raggiunta: chiuderla costa {_px(cost)}. Take profit se scende a {_px(base * (1 - s.TAKE_PROFIT_CREDIT_PCT))}, "
+                    f"stop loss se sale a {_px(base * (1 + s.STOP_LOSS_CREDIT_PCT))}, uscita a {s.CLOSE_DTE_THRESHOLD} giorni dalla scadenza (ora {g.dte}).")
+        return (f"Nessuna soglia raggiunta: vale {_px(value)}. Take profit se sale a {_px(base * (1 + s.TAKE_PROFIT_DEBIT_PCT))}, "
+                f"stop loss se scende a {_px(base * (1 - s.STOP_LOSS_DEBIT_PCT))}, uscita a {s.CLOSE_DTE_THRESHOLD} giorni dalla scadenza (ora {g.dte}).")
 
     @staticmethod
     def _with_exit_fills(trade: dict[str, Any], fills: dict[str, float]) -> dict[str, Any] | None:

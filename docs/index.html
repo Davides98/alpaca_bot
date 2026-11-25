@@ -117,6 +117,10 @@
     .rule { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-top: 8px; background: var(--surface-2); }
     .rule strong { color: var(--text); }
     .payoff { width: 100%; height: auto; display: block; margin-top: 8px; }
+    /* Motivo per cui una posizione aperta non viene chiusa */
+    .exit-note { margin-top: 6px; font-size: 11.5px; line-height: 1.4; color: var(--text-2); text-align: left;
+                 font-variant-numeric: tabular-nums; }
+    .exit-note.waiting { color: var(--warn); }
   </style>
 </head>
 <body class="min-h-screen">
@@ -620,6 +624,14 @@
         : `<span>−${amount}</span> <span class="muted text-xs">pagati</span>`;
       return `<div>${main}</div>`;  // il prezzo per azione è nella colonna "Prezzo entrata"
     }
+    // Ultima decisione del bot sulla posizione aperta (legs_json.exit_status, aggiornata a ogni controllo):
+    // spiega perché la posizione resta aperta (soglie non raggiunte, quote larghe, ordine non eseguito...)
+    function exitStatusHtml(st) {
+      if (!st?.text) return "";
+      const waiting = st.state && st.state !== "HOLD";
+      const when = st.at ? ` · ${timeAgo(new Date(st.at))}` : "";
+      return `<div class="exit-note${waiting ? " waiting" : ""}">${waiting ? "⏳ " : ""}${esc(st.text)}<span class="muted">${esc(when)}</span></div>`;
+    }
     // Prezzo netto per azione: "4,00 DB" (debito pagato) / "1,25 CR" (credito incassato)
     const netPriceText = (price) => `${num2.format(Math.abs(price))} <span class="muted text-xs">${price < 0 ? "CR" : "DB"}</span>`;
     // Prezzo di ogni gamba: eseguito (campo `field`) se il bot l'ha salvato, altrimenti il mid al segnale
@@ -701,6 +713,9 @@
           exitTxt = entry < 0
             ? `<div>${num2.format(Math.max(0, -value))}</div><div class="muted text-xs">costo per chiudere ora</div>`
             : `<div>${num2.format(Math.max(0, value))}</div><div class="muted text-xs">valore attuale</div>`;
+          exitTxt += exitStatusHtml(t.legs_json?.exit_status);
+        } else if (isOpen) {
+          exitTxt = `<span class="muted">–</span>` + exitStatusHtml(t.legs_json?.exit_status);
         } else {
           exitTxt = `<span class="muted">–</span>`;
         }
@@ -711,7 +726,7 @@
           <td class="r num">${esc(t.qty ?? "–")}</td>
           <td class="r num">${esc(t.dte ?? "–")}</td>
           <td class="r num">${entryTxt}</td>
-          <td class="r num">${exitTxt}</td>
+          <td class="r num" style="white-space:normal;min-width:170px;max-width:250px">${exitTxt}</td>
           <td class="r num">${costTxt}</td>
           <td class="r num">${riskTxt}</td>
           <td class="r num">${pnlTxt}</td>

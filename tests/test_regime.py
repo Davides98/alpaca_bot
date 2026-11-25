@@ -465,3 +465,20 @@ def test_risk_manager_stop_loss_needs_confirmation_and_no_leg_fallback() -> None
     rm.manage_open_positions()
     assert len(ex.calls) == 1  # 2/2: prova a chiudere con tetto, ma NON ripiega gamba per gamba
     assert ex.calls[0][0].startswith("CLOSE ") and storage.closed == []
+
+
+def test_exit_status_note_explains_why_position_stays_open() -> None:
+    """La dashboard mostra il motivo: quote larghe, ordine non eseguito o soglie non raggiunte."""
+    cases = [
+        ({"QQQ261224C00695000": (0.05, 1.85), "QQQ261224C00700000": (0.0, 0.60)}, "filled", "TAKE_PROFIT_WAIT_WIDE", "troppo larghe"),
+        ({"QQQ261224C00695000": (0.55, 0.65), "QQQ261224C00700000": (0.20, 0.26)}, "canceled", "CLOSE_NOT_FILLED", "pagando al massimo"),
+        ({"QQQ261224C00695000": (1.40, 1.50), "QQQ261224C00700000": (0.30, 0.36)}, "filled", "HOLD", "Take profit se scende a 0,67"),
+    ]
+    for quotes, exec_status, state, fragment in cases:
+        rm, storage = _risk_manager(quotes, _FakeExecutor(status=exec_status))
+        updates: list = []
+        storage.update_trade = lambda trade_id, fields: updates.append(fields)  # type: ignore[method-assign]
+        rm.manage_open_positions()
+        note = updates[-1]["legs_json"]["exit_status"]
+        assert note["state"] == state, (state, note)
+        assert fragment in note["text"], note["text"]
