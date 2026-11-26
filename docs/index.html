@@ -26,6 +26,8 @@
       --bad: #d03b3b;
       --warn: #b07a00;
       --accent-soft: rgba(42, 120, 214, 0.12);
+      --good-soft: rgba(10, 138, 10, 0.12);
+      --bad-soft: rgba(208, 59, 59, 0.12);
     }
     @media (prefers-color-scheme: dark) {
       :root:not([data-theme="light"]) {
@@ -44,6 +46,8 @@
         --bad: #e66767;
         --warn: #fab219;
         --accent-soft: rgba(57, 135, 229, 0.18);
+        --good-soft: rgba(12, 163, 12, 0.18);
+        --bad-soft: rgba(230, 103, 103, 0.18);
       }
     }
     :root[data-theme="dark"] {
@@ -62,6 +66,8 @@
       --bad: #e66767;
       --warn: #fab219;
       --accent-soft: rgba(57, 135, 229, 0.18);
+      --good-soft: rgba(12, 163, 12, 0.18);
+      --bad-soft: rgba(230, 103, 103, 0.18);
     }
     html, body { background: var(--bg); color: var(--text); }
     body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
@@ -85,6 +91,19 @@
     .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
     .pill.open { color: var(--series); background: var(--accent-soft); border-color: transparent; }
     .pill.sel { color: var(--good); }
+    /* Esito del trade: pieno = risultato definitivo (chiuso), bordato = provvisorio (aperto) */
+    .badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 9px; border-radius: 999px; font-size: 12px;
+             font-weight: 600; white-space: nowrap; border: 1px solid transparent; }
+    .badge.win { color: var(--good); background: var(--good-soft); }
+    .badge.loss { color: var(--bad); background: var(--bad-soft); }
+    .badge.flat { color: var(--text-2); background: var(--surface-2); }
+    .badge.open-win { color: var(--good); border-color: var(--good); border-style: dashed; }
+    .badge.open-loss { color: var(--bad); border-color: var(--bad); border-style: dashed; }
+    .badge.open-flat { color: var(--text-2); border-color: var(--border); border-style: dashed; }
+    tr.res-win td:first-child { box-shadow: inset 4px 0 0 var(--good); }
+    tr.res-loss td:first-child { box-shadow: inset 4px 0 0 var(--bad); }
+    tr.res-open-win td:first-child { box-shadow: inset 4px 0 0 var(--good-soft); }
+    tr.res-open-loss td:first-child { box-shadow: inset 4px 0 0 var(--bad-soft); }
     .scorebar { height: 6px; border-radius: 3px; background: var(--surface-2); width: 64px; overflow: hidden; display: inline-block; vertical-align: middle; }
     .scorebar > span { display: block; height: 100%; border-radius: 3px; background: var(--series); }
     .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -243,9 +262,9 @@
           <p class="text-sm muted" id="tradesSummary">–</p>
         </div>
         <div class="seg" role="group" aria-label="Filtro stato" id="statusSeg">
-          <button type="button" data-status="ALL" aria-pressed="true">Tutti</button>
-          <button type="button" data-status="OPEN">Aperti</button>
+          <button type="button" data-status="OPEN" aria-pressed="true">Aperti</button>
           <button type="button" data-status="CLOSED">Chiusi</button>
+          <button type="button" data-status="ALL">Tutti</button>
         </div>
       </div>
       <div class="table-wrap">
@@ -260,6 +279,8 @@
         </table>
       </div>
       <p class="text-xs muted px-5 py-3" style="border-top: 1px solid var(--border);">
+        <strong class="t2">Esito</strong>: <span class="badge win">✓ Vinto</span> / <span class="badge loss">✕ Perso</span> = risultato definitivo di un trade chiuso;
+        <span class="badge open-win">▲ In guadagno</span> / <span class="badge open-loss">▼ In perdita</span> (bordo tratteggiato) = situazione provvisoria di una posizione aperta, che può ancora cambiare.<br>
         <strong class="t2">Prezzo entrata / uscita</strong>: prezzo netto per azione dell'ordine eseguito (DB = debito pagato, CR = credito incassato) e, sotto, il prezzo di ogni gamba
         (eseguito, oppure "mid" = prezzo medio al segnale per i trade registrati prima di questa funzione). Per le posizioni aperte, "attuale" è il valore stimato dall'ultimo controllo del bot.
         <strong class="t2">Costo</strong>: soldi pagati (debito) o incassati (credito) all'apertura = prezzo netto × 100 × contratti; per i trade chiusi c'è anche il costo della chiusura.
@@ -355,7 +376,7 @@
     // ------------------------------------------------------------------ //
     // Stato
     // ------------------------------------------------------------------ //
-    const state = { snapshots: [], trades: [], screening: [], unit: "usd", rangeDays: -1, status: "ALL" };
+    const state = { snapshots: [], trades: [], screening: [], unit: "usd", rangeDays: -1, status: "OPEN" };
     let chart = null;
     let db = null;
 
@@ -660,6 +681,24 @@
       return Number.isFinite(perContract) && perContract > 0 ? perContract * qty : null;
     }
 
+    // Esito del trade: VINTO / PERSO quando è chiuso, IN GUADAGNO / IN PERDITA finché è aperto
+    function tradeOutcome(t) {
+      const isOpen = t.status === "OPEN";
+      const raw = isOpen ? t.unrealized_pnl : t.pnl;
+      if (raw === null || raw === undefined) {
+        return isOpen ? { cls: "open-flat", row: "", label: "In corso" } : { cls: "flat", row: "", label: "Esito non disponibile" };
+      }
+      const v = Number(raw);
+      if (isOpen) {
+        if (v > 0) return { cls: "open-win", row: "res-open-win", label: "▲ In guadagno" };
+        if (v < 0) return { cls: "open-loss", row: "res-open-loss", label: "▼ In perdita" };
+        return { cls: "open-flat", row: "", label: "In pari" };
+      }
+      if (v > 0) return { cls: "win", row: "res-win", label: "✓ Vinto" };
+      if (v < 0) return { cls: "loss", row: "res-loss", label: "✕ Perso" };
+      return { cls: "flat", row: "", label: "In pari" };
+    }
+
     function renderTrades() {
       const all = state.trades;
       const open = all.filter((t) => t.status === "OPEN");
@@ -667,13 +706,20 @@
       const realized = closed.reduce((a, t) => a + Number(t.pnl || 0), 0);
       const unreal = open.reduce((a, t) => a + Number(t.unrealized_pnl || 0), 0);
       const wins = closed.filter((t) => Number(t.pnl) > 0).length;
+      const losses = closed.filter((t) => t.pnl !== null && Number(t.pnl) < 0).length;
       const scored = closed.filter((t) => t.pnl !== null).length;
+      const openWin = open.filter((t) => Number(t.unrealized_pnl) > 0).length;
+      const openLoss = open.filter((t) => Number(t.unrealized_pnl) < 0).length;
       const openRisk = open.reduce((a, t) => a + (tradeMaxRisk(t) || 0), 0);
       $("tradesSummary").innerHTML =
         `${open.length} aperti · ${closed.length} chiusi · P&L realizzato <span class="num ${cls(realized)}">${fmtUsd(realized)}</span>` +
         ` · non realizzato <span class="num ${cls(unreal)}">${fmtUsd(unreal)}</span>` +
         (open.length ? ` · rischio max posizioni aperte <span class="num">${usd.format(openRisk)}</span>` : "") +
-        (scored ? ` · win rate ${Math.round((wins / scored) * 100)}%` : "");
+        (scored ? ` · win rate ${Math.round((wins / scored) * 100)}%` : "") +
+        `<div class="flex flex-wrap gap-2 mt-2">` +
+        `<span class="badge win">✓ Vinti ${wins}</span><span class="badge loss">✕ Persi ${losses}</span>` +
+        (open.length ? `<span class="badge open-win">▲ Aperti in guadagno ${openWin}</span><span class="badge open-loss">▼ Aperti in perdita ${openLoss}</span>` : "") +
+        `</div>`;
 
       const rows = state.status === "ALL" ? all : all.filter((t) => t.status === state.status);
       if (!rows.length) {
@@ -695,9 +741,11 @@
         // % sul credito incassato / debito pagato: è il numero che il bot confronta con le soglie TP/SL
         const basis = Math.abs(entry) * 100 * Number(t.qty || 1);
         const pnlPct = basis > 0 && pnl !== null && pnl !== undefined ? (Number(pnl) / basis) * 100 : null;
+        const outcome = tradeOutcome(t);
+        const badge = `<div style="margin-top:4px"><span class="badge ${outcome.cls}" title="${isOpen ? "Risultato provvisorio: la posizione è ancora aperta" : "Risultato definitivo"}">${outcome.label}</span></div>`;
         const pnlTxt = pnl === null || pnl === undefined
           ? `<span class="muted">–</span>`
-          : `<div><span class="${cls(Number(pnl))}">${arrow(Number(pnl))}${fmtUsd(Number(pnl))}</span></div>` +
+          : `<div><span class="${cls(Number(pnl))}">${fmtUsd(Number(pnl))}</span></div>` +
             `<div class="muted text-xs">${pnlPct !== null ? `${fmtPct(pnlPct)} del ${entry < 0 ? "credito" : "debito"}` : ""}${isOpen ? " · non real." : ""}</div>`;
         const legs = (t.legs_json?.legs || []).map((l) => `${l.side === "buy" ? "+" : "−"}${l.type === "call" ? "C" : "P"}${l.strike}`).join(" ");
         const entryTxt = `<div class="font-semibold">${netPriceText(entry)}</div>${legPricesHtml(t.legs_json?.legs, "fill", true)}`;
@@ -719,14 +767,14 @@
         } else {
           exitTxt = `<span class="muted">–</span>`;
         }
-        return `<tr>
+        return `<tr class="${outcome.row}">
           <td class="num">${dtFmt.format(new Date(t.created_at))}</td>
-          <td><div class="font-semibold">${esc(t.ticker)}</div><span class="pill ${isOpen ? "open" : ""}" style="margin-top:4px"><span class="dot"></span>${isOpen ? "OPEN" : "CLOSED"}</span></td>
-          <td style="white-space:normal;min-width:150px;max-width:190px"><div class="flex items-center gap-1.5">${esc(prettyStrategy(t.strategy))}${infoButton(t.strategy, t.id)}</div><div class="muted text-xs num">${esc(legs)}${t.legs_json?.expiration ? " · " + esc(t.legs_json.expiration) : ""}</div></td>
+          <td><div class="font-semibold">${esc(t.ticker)}</div>${badge}</td>
+          <td style="white-space:normal;min-width:130px;max-width:160px"><div class="flex items-center gap-1.5">${esc(prettyStrategy(t.strategy))}${infoButton(t.strategy, t.id)}</div><div class="muted text-xs num">${esc(legs)}${t.legs_json?.expiration ? " · " + esc(t.legs_json.expiration) : ""}</div></td>
           <td class="r num">${esc(t.qty ?? "–")}</td>
           <td class="r num">${esc(t.dte ?? "–")}</td>
           <td class="r num">${entryTxt}</td>
-          <td class="r num" style="white-space:normal;min-width:170px;max-width:250px">${exitTxt}</td>
+          <td class="r num" style="white-space:normal;min-width:150px;max-width:195px">${exitTxt}</td>
           <td class="r num">${costTxt}</td>
           <td class="r num">${riskTxt}</td>
           <td class="r num">${pnlTxt}</td>
